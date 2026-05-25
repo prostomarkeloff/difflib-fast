@@ -2,23 +2,41 @@
 
 # difflib-fast
 
-**The exact `difflib` similarity ratio — at suffix-automaton speed.**
+**The exact `difflib` similarity ratio — up to `8,500×` faster.**
 
 [![Rust 2021](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![exact difflib](https://img.shields.io/badge/difflib-byte--for--byte-blue.svg)](https://docs.python.org/3/library/difflib.html)
+[![vs difflib: up to 8,500×](https://img.shields.io/badge/vs%20difflib-up%20to%208%2C500%C3%97-brightgreen.svg)](#python-package)
+
+The **same number** Python's `difflib` gives you — byte-for-byte, no `autojunk` approximation. A corpus
+stdlib `difflib` would chew on for **~30 minutes** clusters in **~0.2 seconds**.
 
 </div>
 
----
+```python
+import difflib_fast
 
-`difflib.SequenceMatcher.ratio()` tells you how similar two strings are — the way a human diff sees
-it. It is the right metric, and it is **slow**. `difflib-fast` computes the *exact same number*,
-byte-for-byte, with a suffix automaton — so it stays linear exactly where `difflib` falls apart.
+difflib_fast.ratio("the quick brown fox", "the quick brown dog")   # 0.8947368421052632  (== difflib)
+difflib_fast.ratio(pairs)   # list[float] — computed across every core inside Rust, GIL released
+```
+
+<div align="center">
+
+| from Python · real corpus · 12 cores | throughput | vs stdlib `difflib` |
+|---|---|---|
+| `ratio(a, b)` — one call | 2.4k pairs/s | **104×** |
+| `ratio(pairs)` — batch, all cores | 15k pairs/s | **628×** |
+| `cluster_canonicals(corpus)` — the real workload | 199k pairs/s | **8,541×** |
+
+*23 pairs/s → 199,000 pairs/s on the same task. Same answer. ([how ↓](#how-it-works))*
+
+</div>
+
+And a pure-Rust crate, with **zero** Python dependency by default:
 
 ```rust
 use difflib_fast::ratio;
-
 // bit-for-bit identical to difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 assert_eq!(ratio("the quick brown fox", "the quick brown dog"), 0.8947368421052632);
 ```
@@ -180,22 +198,14 @@ pairs = [(a, b) for a in corpus for b in corpus]
 difflib_fast.ratio(pairs)            # list[float], one per pair — fanned out over all cores
 ```
 
-This matters because Python *can't* parallelize the stdlib version: `difflib` in a thread pool stays
-GIL-bound and doesn't speed up at all. The batch form sidesteps that entirely — the parallelism lives
-in Rust, not in Python threads. Measured on real canonicalized Python (mypy, M3 Pro, 12 threads,
-`benchmarks/bench_python.py`):
-
-| from Python | throughput | vs stdlib `difflib` |
-|---|---|---|
-| `ratio(a, b)` — one call | 2.4k pairs/s | **104×** |
-| `ratio(pairs)` — batch, all cores | 15k pairs/s | **628×** |
-| `cluster_canonicals(corpus)` — the real workload | 199k eff. pairs/s | **8,541×** |
-| `difflib` in a `ThreadPoolExecutor` | 23 pairs/s | 1.0× — *threads don't help* |
+This matters because Python *can't* parallelize the stdlib version: `difflib` in a `ThreadPoolExecutor`
+stays GIL-bound — **23 → 23 pairs/s, zero speedup**. The batch form sidesteps that entirely: the
+parallelism lives in Rust, not in Python threads, so it just scales (numbers up top; full harness in
+[`benchmarks/bench_python.py`](benchmarks/bench_python.py), measured on real canonicalized Python,
+M3 Pro, 12 threads).
 
 Clustering wins biggest because each string's automaton is built **once** and reused across the whole
-`n²` join (and dissimilar pairs early-exit) — so it's not 12× the per-call speed, it's a different
-algorithm. The number you'd actually feel: a corpus whose all-pairs comparison would take stdlib
-`difflib` **~30 minutes** clusters in **~0.2 s**.
+`n²` join (dissimilar pairs early-exit) — it's not 12× the per-call speed, it's a different algorithm.
 
 The package is **typed** (`py.typed` + `.pyi` stubs — pyright/mypy see the overloads), gated behind the
 `python` cargo feature so the pure-Rust crate keeps **zero** Python dependency by default. Built with
