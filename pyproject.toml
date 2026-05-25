@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "difflib-fast"
+description = "Fast, byte-for-byte exact difflib Ratcliff-Obershelp similarity + clustering."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+classifiers = ["Programming Language :: Rust"]
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["python"]
+module-name = "difflib_fast"

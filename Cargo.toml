@@ -1,0 +1,43 @@
+[package]
+name = "difflib-fast"
+version = "0.1.0"
+description = "Fast, byte-for-byte exact difflib Ratcliff–Obershelp (gestalt) similarity ratio + single-linkage clustering, via a suffix automaton."
+keywords = ["difflib", "similarity", "ratcliff-obershelp", "suffix-automaton", "fuzzy"]
+categories = ["algorithms", "text-processing"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/prostomarkeloff/difflib-fast"
+authors = ["prostomarkeloff"]
+
+[lib]
+name = "difflib_fast"
+# rlib for the bench bin + downstream crates; cdylib for the (optional) Python extension via maturin.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rayon = "1"
+# Optional Python bindings (pip install difflib-fast): build the extension module with maturin
+# and `--features python`. The pure-Rust crate has zero Python dependency.
+pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
+# Used ONLY as the bench binary's global allocator (libraries must not set one) — gated so the
+# published library never pulls it in. macOS's default malloc madvise churn cost ~25% once parallel.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3"]
+bench = ["dep:mimalloc"] # enables the `bench` binary's mimalloc global allocator
+
+[[bin]]
+name = "bench"
+required-features = ["bench"]
+
+# Strict clippy: all + pedantic denied (priority -1 so crate-local `#[allow]`s on hot paths override).
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# Keep symbols + line tables in release so an external sampler (samply) can resolve frames.
+[profile.release]
+debug = "line-tables-only"
+strip = false

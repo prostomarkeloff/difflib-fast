@@ -1,0 +1,9 @@
+# Rust build artifacts (this crate's, the bench bin's, and benchmarks/compare's)
+target/
+
+# samply / profiling output
+*.json.gz
+flame.svg
+
+# macOS
+.DS_Store

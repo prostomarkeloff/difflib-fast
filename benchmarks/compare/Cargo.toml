@@ -1,0 +1,20 @@
+# Standalone benchmark harness (NOT part of the difflib-fast library): head-to-head vs the other
+# exact-RO Rust crates. Kept out of the library crate so it carries no competitor dependencies.
+[package]
+name = "compare"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "compare"
+path = "src/main.rs"
+
+[dependencies]
+difflib-fast = { path = "../.." }
+rayon = "1"
+difflib = "0.4"
+gestalt_ratio = "0.2"
+
+[profile.release]
+debug = false
