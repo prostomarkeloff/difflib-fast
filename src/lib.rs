@@ -439,7 +439,7 @@ fn qualifying_pairs(chars: &[Vec<char>], sams: &[gestalt::Sam], threshold: f64) 
             let rows = &rows;
             scope.spawn(move || {
                 while rows.load(Ordering::Relaxed) < n {
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                     let done = rows.load(Ordering::Relaxed);
                     eprintln!("    [difflib-fast] qualifying_pairs: row {done}/{n} ({:.0}%)", done as f64 / n as f64 * 100.0);
                 }
@@ -616,7 +616,7 @@ fn minhash(shingles: &[u64], perms: &[(u64, u64)]) -> Vec<u64> {
 /// LSH candidate pairs: documents that share a full band signature in any band (an O(n)-ish proxy
 /// for "Jaccard above the band threshold" — recall tuned via `band_rows`).
 fn lsh_candidates(sigs: &[Vec<u64>], band_rows: usize) -> HashSet<(usize, usize)> {
-    let bands = if band_rows == 0 { 0 } else { sigs.first().map_or(0, Vec::len) / band_rows };
+    let bands = sigs.first().map_or(0, Vec::len).checked_div(band_rows).unwrap_or(0);
     let mut candidates: HashSet<(usize, usize)> = HashSet::new();
     for band in 0..bands {
         let lo = band * band_rows;
