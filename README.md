@@ -195,8 +195,13 @@ difflib_fast.cluster_canonicals(["def f(a): ...", "def f(x): ...", "other"], 0.5
 
 ```python
 pairs = [(a, b) for a in corpus for b in corpus]
-difflib_fast.ratio(pairs)            # list[float], one per pair — fanned out over all cores
+difflib_fast.ratio(pairs)              # list[float], one per pair — fanned out over all cores
+difflib_fast.ratio(pairs, threads=4)   # …or cap it to 4 workers for this call
 ```
+
+By default it uses every core; pass `threads=N` to any batch call (`ratio(pairs, …)`,
+`cluster_canonicals(…)`) to cap the pool for that call, or set `RAYON_NUM_THREADS` to change the
+process-wide default with no code. Thread count never changes the result — only the speed.
 
 This matters because Python *can't* parallelize the stdlib version: `difflib` in a `ThreadPoolExecutor`
 stays GIL-bound — **23 → 23 pairs/s, zero speedup**. The batch form sidesteps that entirely: the

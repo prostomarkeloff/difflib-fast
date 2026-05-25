@@ -22,15 +22,17 @@ __all__ = ["ratio", "cluster_canonicals", "cluster_canonicals_lsh"]
 @overload
 def ratio(a: str, b: str, /) -> float: ...
 @overload
-def ratio(pairs: list[tuple[str, str]], /) -> list[float]: ...
-def ratio(a, b=None, /):
+def ratio(pairs: list[tuple[str, str]], /, *, threads: int = 0) -> list[float]: ...
+def ratio(a, b=None, /, *, threads=0):
     """Exact ``difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()`` — byte-for-byte.
 
     - ``ratio(a, b)`` → one float for the pair.
     - ``ratio(pairs)`` → one float per ``(a, b)`` pair, computed in parallel across all cores inside
       Rust (the GIL is released), so a batch saturates every core with no ``ThreadPoolExecutor`` and no
-      per-call overhead. ``ratio(pairs)[i] == ratio(*pairs[i])``, in order.
+      per-call overhead. ``ratio(pairs)[i] == ratio(*pairs[i])``, in order. Pass ``threads=N`` to cap
+      the pool to N workers for this call (``threads=0``, the default, uses every core — itself tunable
+      process-wide via the ``RAYON_NUM_THREADS`` environment variable).
     """
     if b is None:
-        return _ratio_many(a)
+        return _ratio_many(a, threads)
     return _ratio(a, b)

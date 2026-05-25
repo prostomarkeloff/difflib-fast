@@ -689,6 +689,18 @@ pub fn cluster_canonicals_lsh(canonicals: &[String], threshold: f64, num_perm: u
 mod python {
     use pyo3::prelude::*;
 
+    /// Run `f` on a rayon pool of `threads` workers; `threads == 0` uses the global pool (all cores,
+    /// itself tunable process-wide via `RAYON_NUM_THREADS`). A bad pool build falls back to global.
+    fn run_on_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+        if threads == 0 {
+            return f();
+        }
+        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            Ok(pool) => pool.install(f),
+            Err(_) => f(),
+        }
+    }
+
     /// `ratio(a, b)` — fast exact `difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()`.
     ///
     /// Releases the GIL for the compute (the inputs are copied to owned `String`s first), so calling
@@ -700,31 +712,37 @@ mod python {
         py.detach(|| super::ratio(&a, &b))
     }
 
-    /// `ratio_many(pairs)` → one exact ratio per `(a, b)` pair, **computed across all cores inside
-    /// Rust** (rayon, GIL released). Backs the list form of the public `ratio` — the contention-free
-    /// batch path, no `ThreadPoolExecutor`.
+    /// `ratio_many(pairs, threads=0)` → one exact ratio per `(a, b)` pair, **computed across cores
+    /// inside Rust** (rayon, GIL released). Backs the list form of the public `ratio` — the
+    /// contention-free batch path, no `ThreadPoolExecutor`. `threads=0` = all cores; `threads=N` caps
+    /// it to N for this call.
     #[pyfunction]
+    #[pyo3(signature = (pairs, threads=0))]
     #[allow(clippy::needless_pass_by_value)]
-    fn ratio_many(py: Python<'_>, pairs: Vec<(String, String)>) -> Vec<f64> {
-        py.detach(|| super::ratio_many(&pairs))
+    fn ratio_many(py: Python<'_>, pairs: Vec<(String, String)>, threads: usize) -> Vec<f64> {
+        py.detach(|| run_on_threads(threads, || super::ratio_many(&pairs)))
     }
 
-    /// `cluster_canonicals(canonicals, threshold)` → `[(member indices, min pairwise ratio)]`.
+    /// `cluster_canonicals(canonicals, threshold, threads=0)` → `[(member indices, min pairwise
+    /// ratio)]`.
     ///
-    /// Fans the all-pairs join out across every core internally (rayon) — one call, full multicore,
-    /// no Python threads needed. The GIL is released during the compute, so it never blocks the rest
-    /// of your program. This is the contention-free way to use all cores from Python.
+    /// Fans the all-pairs join out across cores internally (rayon) — one call, full multicore, no
+    /// Python threads needed. The GIL is released during the compute, so it never blocks the rest of
+    /// your program. `threads=0` = all cores; `threads=N` caps it to N for this call.
     #[pyfunction]
+    #[pyo3(signature = (canonicals, threshold, threads=0))]
     #[allow(clippy::needless_pass_by_value)]
-    fn cluster_canonicals(py: Python<'_>, canonicals: Vec<String>, threshold: f64) -> Vec<(Vec<usize>, f64)> {
-        py.detach(|| super::cluster_canonicals(&canonicals, threshold))
+    fn cluster_canonicals(py: Python<'_>, canonicals: Vec<String>, threshold: f64, threads: usize) -> Vec<(Vec<usize>, f64)> {
+        py.detach(|| run_on_threads(threads, || super::cluster_canonicals(&canonicals, threshold)))
     }
 
-    /// `cluster_canonicals_lsh(canonicals, threshold, num_perm, band_rows)` — scalable LSH variant.
+    /// `cluster_canonicals_lsh(canonicals, threshold, num_perm, band_rows, threads=0)` — scalable LSH
+    /// variant. `threads=0` = all cores; `threads=N` caps it to N for this call.
     #[pyfunction]
+    #[pyo3(signature = (canonicals, threshold, num_perm, band_rows, threads=0))]
     #[allow(clippy::needless_pass_by_value)]
-    fn cluster_canonicals_lsh(py: Python<'_>, canonicals: Vec<String>, threshold: f64, num_perm: usize, band_rows: usize) -> Vec<(Vec<usize>, f64)> {
-        py.detach(|| super::cluster_canonicals_lsh(&canonicals, threshold, num_perm, band_rows))
+    fn cluster_canonicals_lsh(py: Python<'_>, canonicals: Vec<String>, threshold: f64, num_perm: usize, band_rows: usize, threads: usize) -> Vec<(Vec<usize>, f64)> {
+        py.detach(|| run_on_threads(threads, || super::cluster_canonicals_lsh(&canonicals, threshold, num_perm, band_rows)))
     }
 
     /// Compiled core of the `difflib_fast` Python package (re-exported by `difflib_fast/__init__.py`).
