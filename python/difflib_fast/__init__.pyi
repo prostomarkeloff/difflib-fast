@@ -1,11 +1,23 @@
 """Type stubs for difflib-fast — exact difflib Ratcliff-Obershelp similarity + clustering."""
 
-def ratio(a: str, b: str) -> float:
+from typing import overload
+
+@overload
+def ratio(a: str, b: str, /) -> float:
     """Exact ``difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()`` — byte-for-byte.
 
     The Ratcliff-Obershelp similarity ``2*M / (len(a) + len(b))``, identical to Python's ``difflib``
     (including its argument-order asymmetry), computed via a suffix automaton so it stays linear on
     long, repetitive inputs where ``difflib`` degrades.
+    """
+
+@overload
+def ratio(pairs: list[tuple[str, str]], /) -> list[float]:
+    """Exact :func:`ratio` for many ``(a, b)`` pairs at once, computed across all cores inside Rust.
+
+    ``ratio(pairs)[i] == ratio(*pairs[i])``, bit-for-bit. The parallel fan-out happens in Rust with the
+    GIL released — the contention-free way to score a batch from Python: no ``ThreadPoolExecutor``, no
+    per-call overhead. Returns one float per input pair, in order.
     """
 
 def cluster_canonicals(canonicals: list[str], threshold: float) -> list[tuple[list[int], float]]:

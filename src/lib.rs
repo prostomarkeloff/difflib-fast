@@ -111,6 +111,17 @@ pub fn ratio_b2j(a: &str, b: &str) -> f64 {
     ratio_b2j_chars(&av, &bv, &cb)
 }
 
+/// Exact difflib [`ratio`] for many `(a, b)` pairs at once, computed **in parallel across all cores**
+/// (rayon). `ratio_many(pairs)[i]` equals `ratio(&pairs[i].0, &pairs[i].1)`, bit-for-bit.
+///
+/// This is the batch primitive: hand it the whole workload and the fan-out happens inside Rust — from
+/// Python it runs with the GIL released, so it saturates every core with no `ThreadPoolExecutor` and
+/// no per-call Python overhead.
+#[must_use]
+pub fn ratio_many(pairs: &[(String, String)]) -> Vec<f64> {
+    pairs.par_iter().map(|(a, b)| ratio(a, b)).collect()
+}
+
 // ───────────────────────── reference b2j path (independent oracle) ─────────────────────────
 // A faithful port of difflib's own algorithm (popular-character `b2j` index + the
 // `find_longest_match` recursion). Slower (this is what the suffix automaton replaces), kept as a
@@ -679,29 +690,48 @@ mod python {
     use pyo3::prelude::*;
 
     /// `ratio(a, b)` — fast exact `difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()`.
+    ///
+    /// Releases the GIL for the compute (the inputs are copied to owned `String`s first), so calling
+    /// this from many Python threads actually scales across cores instead of serializing on the GIL.
+    /// Backs the scalar form of the public `ratio`; for a batch the package routes to `ratio_many`.
     #[pyfunction]
-    fn ratio(a: &str, b: &str) -> f64 {
-        super::gestalt_ratio(a, b)
+    fn ratio(py: Python<'_>, a: &str, b: &str) -> f64 {
+        let (a, b) = (a.to_owned(), b.to_owned());
+        py.detach(|| super::ratio(&a, &b))
+    }
+
+    /// `ratio_many(pairs)` → one exact ratio per `(a, b)` pair, **computed across all cores inside
+    /// Rust** (rayon, GIL released). Backs the list form of the public `ratio` — the contention-free
+    /// batch path, no `ThreadPoolExecutor`.
+    #[pyfunction]
+    #[allow(clippy::needless_pass_by_value)]
+    fn ratio_many(py: Python<'_>, pairs: Vec<(String, String)>) -> Vec<f64> {
+        py.detach(|| super::ratio_many(&pairs))
     }
 
     /// `cluster_canonicals(canonicals, threshold)` → `[(member indices, min pairwise ratio)]`.
+    ///
+    /// Fans the all-pairs join out across every core internally (rayon) — one call, full multicore,
+    /// no Python threads needed. The GIL is released during the compute, so it never blocks the rest
+    /// of your program. This is the contention-free way to use all cores from Python.
     #[pyfunction]
     #[allow(clippy::needless_pass_by_value)]
-    fn cluster_canonicals(canonicals: Vec<String>, threshold: f64) -> Vec<(Vec<usize>, f64)> {
-        super::cluster_canonicals(&canonicals, threshold)
+    fn cluster_canonicals(py: Python<'_>, canonicals: Vec<String>, threshold: f64) -> Vec<(Vec<usize>, f64)> {
+        py.detach(|| super::cluster_canonicals(&canonicals, threshold))
     }
 
     /// `cluster_canonicals_lsh(canonicals, threshold, num_perm, band_rows)` — scalable LSH variant.
     #[pyfunction]
     #[allow(clippy::needless_pass_by_value)]
-    fn cluster_canonicals_lsh(canonicals: Vec<String>, threshold: f64, num_perm: usize, band_rows: usize) -> Vec<(Vec<usize>, f64)> {
-        super::cluster_canonicals_lsh(&canonicals, threshold, num_perm, band_rows)
+    fn cluster_canonicals_lsh(py: Python<'_>, canonicals: Vec<String>, threshold: f64, num_perm: usize, band_rows: usize) -> Vec<(Vec<usize>, f64)> {
+        py.detach(|| super::cluster_canonicals_lsh(&canonicals, threshold, num_perm, band_rows))
     }
 
     /// Compiled core of the `difflib_fast` Python package (re-exported by `difflib_fast/__init__.py`).
     #[pymodule]
     fn _difflib_fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(ratio, m)?)?;
+        m.add_function(wrap_pyfunction!(ratio_many, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals_lsh, m)?)?;
         Ok(())

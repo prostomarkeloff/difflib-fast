@@ -78,6 +78,7 @@ pairwise ratio.
 | function | what |
 |---|---|
 | `ratio(a, b) -> f64` | exact `difflib` ratio (dispatches automaton ⇄ `b2j` per input) |
+| `ratio_many(&[(String, String)]) -> Vec<f64>` | exact `ratio` for a batch of pairs, in parallel (rayon) |
 | `gestalt::gestalt_ratio(a, b) -> f64` | the suffix-automaton path directly |
 | `ratio_reference(a, b) -> f64` | the `b2j` reference port (slow; the test oracle) |
 | `cluster_canonicals(&[String], threshold) -> Vec<(Vec<usize>, f64)>` | exact single-linkage clusters + min pairwise ratio |
@@ -146,9 +147,9 @@ Levenshtein), not `difflib`'s.
 
 ## Python package
 
-A proper, **typed** Python package (`py.typed` + `.pyi` stubs — pyright/mypy see full signatures),
-gated behind the `python` cargo feature so the pure-Rust crate keeps **zero** Python dependency by
-default.
+Swap `difflib.SequenceMatcher(...).ratio()` for `difflib_fast.ratio(...)` and the **same number** comes
+back — hundreds of times faster per call, and **thousands of times** faster when you score a whole
+corpus. That's the entire change: `import difflib_fast`.
 
 ```bash
 # from source (needs a Rust toolchain; pip drives maturin automatically — no manual build):
@@ -160,13 +161,46 @@ pip install git+https://github.com/prostomarkeloff/difflib-fast
 ```python
 import difflib_fast
 
-difflib_fast.ratio("the quick brown fox", "the quick brown dog")   # 0.8947368421052632 — == difflib
+# one pair → one float, byte-for-byte difflib (autojunk=False)
+difflib_fast.ratio("the quick brown fox", "the quick brown dog")   # 0.8947368421052632
+
+# cluster a corpus (single-linkage, exact min pairwise ratio per cluster)
 difflib_fast.cluster_canonicals(["def f(a): ...", "def f(x): ...", "other"], 0.5)
 # → [([0, 1], 0.86…)]
 ```
 
-Built with [maturin](https://github.com/PyO3/maturin) (mixed layout: compiled `_difflib_fast` +
-`python/difflib_fast/` package). Build locally into a venv with `maturin develop --release`.
+### All cores, no contention
+
+`ratio` is **overloaded**: hand it a *list of pairs* and it returns a list of ratios, computing them
+**in parallel across every core inside Rust** — with the GIL released. You don't touch a
+`ThreadPoolExecutor`, you don't fight the GIL; you just pass the batch:
+
+```python
+pairs = [(a, b) for a in corpus for b in corpus]
+difflib_fast.ratio(pairs)            # list[float], one per pair — fanned out over all cores
+```
+
+This matters because Python *can't* parallelize the stdlib version: `difflib` in a thread pool stays
+GIL-bound and doesn't speed up at all. The batch form sidesteps that entirely — the parallelism lives
+in Rust, not in Python threads. Measured on real canonicalized Python (mypy, M3 Pro, 12 threads,
+`benchmarks/bench_python.py`):
+
+| from Python | throughput | vs stdlib `difflib` |
+|---|---|---|
+| `ratio(a, b)` — one call | 2.4k pairs/s | **104×** |
+| `ratio(pairs)` — batch, all cores | 15k pairs/s | **628×** |
+| `cluster_canonicals(corpus)` — the real workload | 199k eff. pairs/s | **8,541×** |
+| `difflib` in a `ThreadPoolExecutor` | 23 pairs/s | 1.0× — *threads don't help* |
+
+Clustering wins biggest because each string's automaton is built **once** and reused across the whole
+`n²` join (and dissimilar pairs early-exit) — so it's not 12× the per-call speed, it's a different
+algorithm. The number you'd actually feel: a corpus whose all-pairs comparison would take stdlib
+`difflib` **~30 minutes** clusters in **~0.2 s**.
+
+The package is **typed** (`py.typed` + `.pyi` stubs — pyright/mypy see the overloads), gated behind the
+`python` cargo feature so the pure-Rust crate keeps **zero** Python dependency by default. Built with
+[maturin](https://github.com/PyO3/maturin) (mixed layout: compiled `_difflib_fast` +
+`python/difflib_fast/` package); build locally into a venv with `maturin develop --release --features python`.
 
 ---
 
