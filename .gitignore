@@ -1,6 +1,15 @@
 # Rust build artifacts (this crate's, the bench bin's, and benchmarks/compare's)
 target/
 
+# Python build artifacts (maturin develop drops the compiled module + caches into python-source)
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.dylib
+dist/
+*.egg-info/
+
 # samply / profiling output
 *.json.gz
 flame.svg

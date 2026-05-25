@@ -698,8 +698,9 @@ mod python {
         super::cluster_canonicals_lsh(&canonicals, threshold, num_perm, band_rows)
     }
 
+    /// Compiled core of the `difflib_fast` Python package (re-exported by `difflib_fast/__init__.py`).
     #[pymodule]
-    fn difflib_fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    fn _difflib_fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(ratio, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals_lsh, m)?)?;

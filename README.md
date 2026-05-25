@@ -144,15 +144,29 @@ Levenshtein), not `difflib`'s.
 
 ---
 
-## Python bindings
+## Python package
 
-The pure-Rust crate has **zero** Python dependency. Build with the `python` feature +
-[maturin](https://github.com/PyO3/maturin) for a `pip install`-able extension exposing `ratio`,
-`cluster_canonicals`, and `cluster_canonicals_lsh`:
+A proper, **typed** Python package (`py.typed` + `.pyi` stubs — pyright/mypy see full signatures),
+gated behind the `python` cargo feature so the pure-Rust crate keeps **zero** Python dependency by
+default.
 
 ```bash
-maturin develop --release --features python
+# from source (needs a Rust toolchain; pip drives maturin automatically — no manual build):
+pip install git+https://github.com/prostomarkeloff/difflib-fast
+
+# or grab a prebuilt abi3 wheel (CPython 3.9+) from the GitHub Releases page — no Rust needed.
 ```
+
+```python
+import difflib_fast
+
+difflib_fast.ratio("the quick brown fox", "the quick brown dog")   # 0.8947368421052632 — == difflib
+difflib_fast.cluster_canonicals(["def f(a): ...", "def f(x): ...", "other"], 0.5)
+# → [([0, 1], 0.86…)]
+```
+
+Built with [maturin](https://github.com/PyO3/maturin) (mixed layout: compiled `_difflib_fast` +
+`python/difflib_fast/` package). Build locally into a venv with `maturin develop --release`.
 
 ---
 

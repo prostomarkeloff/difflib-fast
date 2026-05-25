@@ -8,6 +8,8 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/prostomarkeloff/difflib-fast"
 authors = ["prostomarkeloff"]
+# The benchmark suite + corpora (large, derived) are not part of the published crate / Python sdist.
+exclude = ["/benchmarks"]
 
 [lib]
 name = "difflib_fast"
@@ -16,9 +18,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rayon = "1"
-# Optional Python bindings (pip install difflib-fast): build the extension module with maturin
-# and `--features python`. The pure-Rust crate has zero Python dependency.
-pyo3 = { version = "0.28", optional = true, features = ["extension-module"] }
+# Optional Python bindings (the `python` feature, built by maturin). `abi3-py39` → one wheel per
+# platform works on CPython 3.9+. The pure-Rust crate has zero Python dependency by default.
+pyo3 = { version = "0.28", optional = true, features = ["extension-module", "abi3-py39"] }
 # Used ONLY as the bench binary's global allocator (libraries must not set one) — gated so the
 # published library never pulls it in. macOS's default malloc madvise churn cost ~25% once parallel.
 mimalloc = { version = "0.1", default-features = false, optional = true }
