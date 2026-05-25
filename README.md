@@ -169,11 +169,30 @@ Swap `difflib.SequenceMatcher(...).ratio()` for `difflib_fast.ratio(...)` and th
 back — hundreds of times faster per call, and **thousands of times** faster when you score a whole
 corpus. That's the entire change: `import difflib_fast`.
 
-```bash
-# from source (needs a Rust toolchain; pip drives maturin automatically — no manual build):
-pip install git+https://github.com/prostomarkeloff/difflib-fast
+**No PyPI** — `pip install difflib-fast` won't work. Two ways to install:
 
-# or grab a prebuilt abi3 wheel (CPython 3.9+) from the GitHub Releases page — no Rust needed.
+**1. Prebuilt wheel — no Rust toolchain needed.** The wheels are `cp39-abi3`, so one wheel per platform
+works on **every CPython ≥ 3.9, including 3.14**. GitHub Releases isn't a package index, so pip can't
+pick the wheel for you — grab the one for your platform from the
+[Releases page](https://github.com/prostomarkeloff/difflib-fast/releases/latest) and install it by URL:
+
+```bash
+# macOS Apple Silicon — swap the filename for your platform (see below):
+pip install https://github.com/prostomarkeloff/difflib-fast/releases/download/v0.1.2/difflib_fast-0.1.2-cp39-abi3-macosx_11_0_arm64.whl
+```
+
+| platform | wheel suffix |
+|---|---|
+| macOS Apple Silicon | `…-macosx_11_0_arm64.whl` |
+| macOS Intel | `…-macosx_10_12_x86_64.whl` |
+| Linux x86_64 | `…-manylinux_2_17_x86_64.manylinux2014_x86_64.whl` |
+| Linux aarch64 | `…-manylinux_2_17_aarch64.manylinux2014_aarch64.whl` |
+| Windows x64 | `…-win_amd64.whl` |
+
+**2. From source — needs a Rust toolchain** (pip drives maturin automatically, no manual build):
+
+```bash
+pip install git+https://github.com/prostomarkeloff/difflib-fast
 ```
 
 ```python
