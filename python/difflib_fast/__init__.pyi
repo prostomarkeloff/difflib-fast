@@ -44,4 +44,39 @@ def cluster_canonicals_lsh(
     ``threads=N`` caps the pool to N workers for this call (``threads=0``, default, uses every core).
     """
 
+class Rationer:
+    """Stateful similarity/clustering handle that owns the backend resources once and reuses them.
+
+    On a macOS wheel built with the ``gpu`` feature, ``cluster_canonicals`` runs on the Metal GPU
+    when the group is large enough to amortize dispatch (~1.1-1.4x vs CPU on Apple Silicon); on every
+    other wheel, or with no Metal device, it transparently runs on CPU with byte-for-byte identical
+    output. ``ratio`` / ``ratio_many`` always run on CPU (the GPU offload measured slower there).
+    """
+
+    def __init__(self, concurrency: str = "gpu+cpu", threads: int = 0, delta: float = 0.0) -> None:
+        """Build a handle.
+
+        - ``concurrency``: ``"cpu"``, ``"gpu"``, or ``"gpu+cpu"`` (default). On a non-Metal build/host
+          ``"gpu"``/``"gpu+cpu"`` quietly fall back to CPU.
+        - ``threads``: rayon worker count for CPU-side work; ``0`` (default) uses every core.
+        - ``delta``: approximate-RO knob; ``0.0`` (default) = exact, bit-identical to ``difflib``.
+        """
+
+    @property
+    def concurrency(self) -> str:
+        """Active backend after construction-time fallback: ``"cpu"``, ``"gpu"``, or ``"gpu+cpu"``."""
+
+    @property
+    def delta(self) -> float:
+        """Active approximate-RO ``delta`` (``0.0`` = exact)."""
+
+    def ratio(self, a: str, b: str) -> float:
+        """Single-pair exact ratio (always CPU)."""
+
+    def ratio_many(self, pairs: list[tuple[str, str]]) -> list[float]:
+        """Batched exact ratio over ``(a, b)`` pairs, across all cores (GIL released). Always CPU."""
+
+    def cluster_canonicals(self, canonicals: list[str], threshold: float) -> list[tuple[list[int], float]]:
+        """Exact single-linkage clustering at ``threshold``; GPU-accelerated where it wins (see class doc)."""
+
 __all__: list[str]

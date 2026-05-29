@@ -65,7 +65,10 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          # macOS wheels ship the Metal GPU path. CLI `--features` replaces pyproject's
+          # `features=["python"]`, so list both. `gpu` is macOS-only; degrades to CPU at runtime
+          # when no Metal device is present.
+          args: --release --features python,gpu --out dist
           sccache: "true"
       - uses: actions/upload-artifact@v4
         with:

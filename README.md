@@ -93,15 +93,55 @@ pairwise ratio.
 
 ## API
 
+Two tiers. The **free functions** are the stateless CPU drop-in:
+
 | function | what |
 |---|---|
 | `ratio(a, b) -> f64` | exact `difflib` ratio (dispatches automaton ⇄ `b2j` per input) |
 | `ratio_many(&[(String, String)]) -> Vec<f64>` | exact `ratio` for a batch of pairs, in parallel (rayon) |
 | `gestalt::gestalt_ratio(a, b) -> f64` | the suffix-automaton path directly |
-| `ratio_reference(a, b) -> f64` | the `b2j` reference port (slow; the test oracle) |
 | `cluster_canonicals(&[String], threshold) -> Vec<(Vec<usize>, f64)>` | exact single-linkage clusters + min pairwise ratio |
-| `cluster_canonicals_chars(&[Vec<char>], threshold)` | same, over pre-collected `char` vectors |
 | `cluster_canonicals_lsh(&[String], threshold, num_perm, band_rows)` | scalable MinHash-LSH variant (candidate-gen + exact verify) for very large corpora |
+
+And `Rationer` is the **stateful handle** that owns long-lived resources (rayon pool, and on
+macOS the Metal device) once and reuses them across calls — same exact output, with an optional GPU
+path:
+
+```rust
+use difflib_fast::Rationer;
+
+let r = Rationer::new();                          // builder().build(); default GpuPlusCpu
+let clusters = r.cluster_canonicals(&corpus, 0.6); // GPU-accelerated on macOS (see below)
+let ratios   = r.ratio_many(&pairs);               // CPU
+```
+
+`Rationer::builder().concurrency(Concurrency::Cpu | Gpu | GpuPlusCpu).threads(n).delta(d).build()`
+configures it; `PreparedRationer` (`r.prepare(&strings)`) amortizes SAM-build over many index-pair
+queries.
+
+### GPU (macOS + Metal)
+
+Behind the `gpu` cargo feature on Apple Silicon, `Rationer::cluster_canonicals` offloads the
+suffix-automaton `matching_stats` walk to a Metal compute kernel — **byte-for-byte identical output**,
+**~1.1–1.4×** end-to-end vs the (already fast) CPU path on a single large group:
+
+| corpus | `cluster_canonicals` GPU vs CPU |
+|---|---|
+| mypy | **1.38×** |
+| ha | 1.25× |
+| sympy | 1.17× |
+| django | 1.14× |
+| transformers | 1.08× |
+
+It's a modest, honest win: the GPU only does `matching_stats` (~⅓ of the per-pair cost); the
+`longest_in` recursion, filtering and assembly stay on CPU, so Amdahl caps it. `ratio_many` and
+`cluster_canonicals_multi` measured *slower* on the GPU at every size tested, so they stay on CPU by
+default (the GPU paths remain opt-in via `DFGPU_RATIO_MANY_THRESHOLD` / `DFGPU_MULTI_THRESHOLD`). With
+the feature off, on non-macOS, or with no Metal device, every call quietly runs on CPU.
+
+```toml
+difflib-fast = { version = "0.1", features = ["gpu"] }   # macOS only
+```
 
 ---
 
@@ -178,7 +218,7 @@ pick the wheel for you — grab the one for your platform from the
 
 ```bash
 # macOS Apple Silicon — swap the filename for your platform (see below):
-pip install https://github.com/prostomarkeloff/difflib-fast/releases/download/v0.1.2/difflib_fast-0.1.2-cp39-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/prostomarkeloff/difflib-fast/releases/download/v0.2.0/difflib_fast-0.2.0-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 | platform | wheel suffix |
@@ -235,6 +275,26 @@ The package is **typed** (`py.typed` + `.pyi` stubs — pyright/mypy see the ove
 `python` cargo feature so the pure-Rust crate keeps **zero** Python dependency by default. Built with
 [maturin](https://github.com/PyO3/maturin) (mixed layout: compiled `_difflib_fast` +
 `python/difflib_fast/` package); build locally into a venv with `maturin develop --release --features python`.
+
+### GPU from Python (macOS)
+
+The **macOS wheels ship the Metal GPU path**. Use the `Rationer` handle — its `cluster_canonicals`
+runs on the GPU when the group is large enough to pay for the dispatch, otherwise CPU; same
+byte-for-byte answer either way:
+
+```python
+import difflib_fast as df
+
+r = df.Rationer(concurrency="gpu+cpu")        # "cpu" | "gpu" | "gpu+cpu" (default)
+r.concurrency                                  # "gpu+cpu" if Metal came up, else "cpu"
+r.cluster_canonicals(corpus, 0.6)              # GPU-accelerated (~1.1–1.4× on Apple Silicon)
+r.ratio_many(pairs)                            # CPU (the GPU offload loses here)
+```
+
+On Linux/Windows wheels, or with no Metal device, a `Rationer` transparently runs everything on CPU.
+Build a GPU wheel locally on macOS with
+`maturin develop --release --features python,gpu` (the CLI `--features` **replaces** the pyproject
+default, so list both).
 
 ---
 

@@ -22,7 +22,8 @@ per second. Speedups (`Nx`) are **difflib-fast ÷ competitor**.
 
 - **Metric:** exact RO, `autojunk=False`. Every "exact RO" comparison below is **byte-for-byte
   verified** against difflib-fast (mismatch counts / max|Δ| reported per section).
-- **Harnesses** (all in [`benchmarks/`](benchmarks/), driver: [`run_all.sh`](benchmarks/run_all.sh)):
+- **Harnesses** (in [`benchmarks/`](benchmarks/); the `run_all.sh` / `profile.sh` runners are local
+  perf tooling, not tracked):
   - `cargo run --release --features bench --bin bench` — difflib-fast self (raw / threshold / cluster).
   - `cargo run --release --example compare` — vs the Rust crates `difflib` + `gestalt_ratio`.
   - `bench_vs_cydifflib.py` — vs CyDifflib, single thread.
@@ -52,6 +53,36 @@ The production path: prebuild each string's suffix automaton once, then an early
 
 (raw 1T at N=300; threshold 1T at N=1000; 12T at N=2000. transformers is slowest everywhere — model
 code has unusually long functions, and per-pair RO is `O(L·log L)`.)
+
+---
+
+## 1b. GPU (Metal) — heterogeneous `cluster_canonicals`
+
+Behind the `gpu` feature on Apple Silicon, `Rationer::cluster_canonicals` runs the suffix-automaton
+`matching_stats` walk on the M3 GPU (Metal compute) while the CPU keeps the filters + `longest_in`
+recursion + assembly. **Byte-for-byte identical** to the CPU path (cluster counts equal across all
+backends, every run). Measured via the `Rationer` API across its three `Concurrency` backends, one
+group, threshold 0.6, N=1500, M3 Pro, best-of-2:
+
+| corpus | CPU | GPU | GPU+CPU | GPU speedup |
+|---|---|---|---|---|
+| mypy | 2.25 s | 1.62 s | 1.63 s | **1.38×** |
+| ha | 2.64 s | 2.10 s | 2.13 s | **1.25×** |
+| sympy | 1.57 s | 1.34 s | 1.31 s | **1.17×** |
+| django | 1.09 s | 0.95 s | 0.98 s | **1.14×** |
+| transformers | 2.69 s | 2.49 s | 2.35 s | **1.08×** |
+
+**Honest read.** The GPU only offloads `matching_stats` — ~⅓ of the per-pair cycle budget; the
+`longest_in` chain walk (the dominant cost), the `quick_ratio` filters, the SAM build and the
+union-find assembly all stay on CPU. By Amdahl that caps the end-to-end win even before the
+fixed per-dispatch overhead, so cluster lands at **1.1–1.4×** and does *not* scale up with N
+(at N≈2200 the single dispatch's `(fstate, fmatch)` output buffer grows and goes bandwidth-bound,
+dropping back toward ~1.15×). The other two operations measured **slower** on the GPU at every size
+tried — `ratio_many` 0.82–0.93× (61k–404k pairs; the CPU intern + prebuilt-SAM path is already
+efficient) and `cluster_canonicals_multi` 0.59–0.99× (the find-dup-defs many-small-groups shape never
+amortizes the dispatch) — so both stay on CPU by default (GPU opt-in via `DFGPU_RATIO_MANY_THRESHOLD`
+/ `DFGPU_MULTI_THRESHOLD`). A widely-quoted "1.5–1.7×" is a *kernel-only* `matching_stats` microbench
+(the kernel itself is ~3× CPU throughput); it does not survive end-to-end.
 
 ---
 

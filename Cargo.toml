@@ -1,6 +1,6 @@
 [package]
 name = "difflib-fast"
-version = "0.1.2"
+version = "0.2.0"
 description = "Fast, byte-for-byte exact difflib Ratcliff–Obershelp (gestalt) similarity ratio + single-linkage clustering, via a suffix automaton."
 keywords = ["difflib", "similarity", "ratcliff-obershelp", "suffix-automaton", "fuzzy"]
 categories = ["algorithms", "text-processing"]
@@ -21,23 +21,51 @@ rayon = "1"
 # Optional Python bindings (the `python` feature, built by maturin). `abi3-py39` → one wheel per
 # platform works on CPython 3.9+. The pure-Rust crate has zero Python dependency by default.
 pyo3 = { version = "0.28", optional = true, features = ["extension-module", "abi3-py39"] }
-# Used ONLY as the bench binary's global allocator (libraries must not set one) — gated so the
-# published library never pulls it in. macOS's default malloc madvise churn cost ~25% once parallel.
+# Used ONLY as the `bench` binary's global allocator (libraries must not set one) — gated behind the
+# `bench` feature so the published library never pulls it in. macOS's default malloc madvise churn
+# cost ~25% once parallel, hence the override for benchmarking.
 mimalloc = { version = "0.1", default-features = false, optional = true }
+# Apple Metal compute bindings — used by the `gpu` feature to run the SAM matching_stats walk on
+# the M3 GPU in parallel with the CPU SAM walker (heterogeneous CPU+GPU exact RO). Apple-only;
+# the feature does not compile on non-Apple targets, and `cluster_canonicals` falls back to the
+# CPU-only path automatically when the GPU device cannot be acquired at runtime.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
 
 [features]
 default = []
 python = ["dep:pyo3"]
 bench = ["dep:mimalloc"] # enables the `bench` binary's mimalloc global allocator
+# Heterogeneous CPU+GPU exact RO — Metal compute shader port of the SAM matching_stats walker.
+# macOS-only; the feature wires up automatically on Apple Silicon and is a no-op on other targets.
+# The kernel reads the corpus SAMs out of unified shared memory (Apple Silicon's UMA = zero copy
+# between CPU and GPU), so there is no host↔device transfer cost. `Rationer` degrades to CPU when
+# this is off or no Metal device can be acquired at runtime.
+gpu = ["dep:metal"]
+# `instrument` adds atomic counters inside `gestalt::longest_in` and its endpos range queries plus
+# the RO recursion, plus a `gestalt::instrument::dump()` API that prints histograms of chain-walk
+# depth, recursion depth, fmatch distribution, the linear-vs-segtree split, and per-call scan
+# lengths. Costs ~10-20% wall when active (relaxed-ordered atomics on the hot path); the
+# `cfg(feature)` gate compiles to a no-op in default builds so production stays untouched.
+instrument = []
 
-[[bin]]
-name = "bench"
-required-features = ["bench"]
+# `objc`'s `sel!`/`msg_send!` macros (pulled in transitively by the `metal` crate under the `gpu`
+# feature) expand to `cfg(feature = "cargo-clippy")` checks — whitelist that cfg so the lint stays
+# on for genuinely-unexpected cfgs without flooding gpu builds with dependency-macro noise.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 # Strict clippy: all + pedantic denied (priority -1 so crate-local `#[allow]`s on hot paths override).
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
+
+# Gold CPU baseline bench (raw ratio / threshold qualify / cluster). Gated behind `bench` so the
+# published library never builds it. The GPU / PMC / cross-impl harness lives outside the tracked
+# tree (see perf-local/).
+[[bin]]
+name = "bench"
+required-features = ["bench"]
 
 # Keep symbols + line tables in release so an external sampler (samply) can resolve frames.
 [profile.release]

@@ -16,9 +16,9 @@
 //! is the scalable `MinHash`-LSH variant (candidate generation + exact verification) for very large
 //! corpora past the O(n²) wall.
 //!
-//! Two independent implementations of `M` live here: the suffix-automaton path ([`gestalt`]) and a
-//! straight port of difflib's `b2j` recursion ([`ratio_reference`]); the test suite asserts they are
-//! bit-identical, which is the crate's core correctness gate.
+//! Two independent implementations of `M` back this: the suffix-automaton path ([`gestalt`]) and a
+//! straight port of difflib's `b2j` recursion (a test-only reference oracle); the test suite asserts
+//! they are bit-identical, which is the crate's core correctness gate.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -27,6 +27,17 @@ use rayon::prelude::*;
 
 pub mod gestalt;
 pub use gestalt::gestalt_ratio;
+
+// Heterogeneous CPU+GPU exact RO — Metal compute backend (Apple Silicon). Behind `feature = "gpu"`
+// + `cfg(target_os = "macos")`; the rest of the crate falls back to the CPU path when it's off or
+// no Metal device is available at runtime.
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+pub mod gpu;
+
+// `Rationer` — the stateful, GPU-accelerated similarity/clustering handle. Always available;
+// degrades to CPU when the `gpu` feature is off or no Metal device can be acquired.
+pub mod rationer;
+pub use rationer::{Concurrency, PreparedRationer, Rationer, RationerBuilder};
 
 /// Dispatch threshold: take the `b2j` path while its estimated work per element
 /// (`Σ_c count_a·count_b / (|a|+|b|)`) stays at/below this; above it the automaton wins. Tuned on real
@@ -98,10 +109,11 @@ fn ratio_chars(a: &[char], b: &[char]) -> f64 {
     }
 }
 
-/// The difflib `b2j` ratio path directly (bypasses the length dispatch) — exposed for benchmarking
-/// and as a second, structurally-distinct exact implementation. Prefer [`ratio`] for real use.
+/// The difflib `b2j` ratio path directly (bypasses the length dispatch) — a second,
+/// structurally-distinct exact implementation kept as a test oracle for the suffix-automaton path.
+#[cfg(test)]
 #[must_use]
-pub fn ratio_b2j(a: &str, b: &str) -> f64 {
+fn ratio_b2j(a: &str, b: &str) -> f64 {
     let av: Vec<char> = a.chars().collect();
     let bv: Vec<char> = b.chars().collect();
     let (cb, ob) = ascii_counts(&bv);
@@ -126,8 +138,10 @@ pub fn ratio_many(pairs: &[(String, String)]) -> Vec<f64> {
 // A faithful port of difflib's own algorithm (popular-character `b2j` index + the
 // `find_longest_match` recursion). Slower (this is what the suffix automaton replaces), kept as a
 // second, structurally-different implementation so the tests can assert the fast path matches it.
+// Test-only: not part of the public API.
 
 /// Code point → ascending positions in `b`.
+#[cfg(test)]
 fn build_b2j(b: &[char]) -> HashMap<char, Vec<usize>> {
     let mut b2j: HashMap<char, Vec<usize>> = HashMap::new();
     for (j, &c) in b.iter().enumerate() {
@@ -137,6 +151,7 @@ fn build_b2j(b: &[char]) -> HashMap<char, Vec<usize>> {
 }
 
 /// difflib `find_longest_match` over `a[alo:ahi] × b[blo:bhi]`; returns `(i, j, k)`.
+#[cfg(test)]
 #[allow(clippy::similar_names)]
 fn find_longest(a: &[char], b2j: &HashMap<char, Vec<usize>>, alo: usize, ahi: usize, blo: usize, bhi: usize) -> (usize, usize, usize) {
     let mut besti = alo;
@@ -169,6 +184,7 @@ fn find_longest(a: &[char], b2j: &HashMap<char, Vec<usize>>, alo: usize, ahi: us
 }
 
 /// Total size of the Ratcliff–Obershelp matching blocks (difflib `get_matching_blocks`).
+#[cfg(test)]
 #[allow(clippy::many_single_char_names)]
 fn matching_count(a: &[char], b: &[char], b2j: &HashMap<char, Vec<usize>>) -> usize {
     let mut total = 0usize;
@@ -189,10 +205,11 @@ fn matching_count(a: &[char], b: &[char], b2j: &HashMap<char, Vec<usize>>) -> us
 }
 
 /// Reference (b2j) difflib ratio — structurally distinct from the suffix-automaton path; the test
-/// suite asserts [`gestalt_ratio`] equals this exactly. Prefer [`ratio`] for real use (far faster).
+/// suite asserts [`gestalt_ratio`] equals this exactly. Test oracle only (not public API).
+#[cfg(test)]
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
-pub fn ratio_reference(a: &str, b: &str) -> f64 {
+fn ratio_reference(a: &str, b: &str) -> f64 {
     let av: Vec<char> = a.chars().collect();
     let bv: Vec<char> = b.chars().collect();
     let total = av.len() + bv.len();
@@ -225,19 +242,6 @@ struct B2jScratch {
 thread_local! {
     /// Reused b2j scratch — no per-pair allocation in the short-string path.
     static B2J: RefCell<B2jScratch> = RefCell::new(B2jScratch::default());
-}
-
-/// Estimated b2j inner-loop work `Σ_c count_a(c)·count_b(c)` — exactly the positions the first-block
-/// scan visits; the dispatch signal, also exposed for benchmarking. (`oa·ob` folds the non-ASCII tail.)
-#[must_use]
-pub fn b2j_work(a: &[char], b: &[char]) -> u64 {
-    let (ca, oa) = ascii_counts(a);
-    let (cb, ob) = ascii_counts(b);
-    let mut w = u64::from(oa) * u64::from(ob);
-    for i in 0..128 {
-        w += u64::from(ca[i]) * u64::from(cb[i]);
-    }
-    w
 }
 
 /// difflib `b2j` ratio: count-sort index (offsets + positions, all buffers reused → ZERO per-pair
@@ -373,7 +377,7 @@ fn find_longest_b2j(
 
 /// difflib `real_quick_ratio`: a length-only upper bound on `ratio` (cheap skip).
 #[allow(clippy::cast_precision_loss)]
-fn real_quick_ratio(a: &[char], b: &[char]) -> f64 {
+pub(crate) fn real_quick_ratio(a: &[char], b: &[char]) -> f64 {
     let total = a.len() + b.len();
     if total == 0 {
         return 1.0;
@@ -383,7 +387,7 @@ fn real_quick_ratio(a: &[char], b: &[char]) -> f64 {
 
 /// Sorted `(char, count)` multiset of `a` — precomputed once per string so the `quick_ratio`
 /// upper-bound filter is a linear merge over the (small) alphabet instead of a per-pair `HashMap`.
-fn char_counts(a: &[char]) -> Vec<(char, u32)> {
+pub(crate) fn char_counts(a: &[char]) -> Vec<(char, u32)> {
     let mut v = a.to_vec();
     v.sort_unstable();
     let mut out: Vec<(char, u32)> = Vec::new();
@@ -399,7 +403,7 @@ fn char_counts(a: &[char]) -> Vec<(char, u32)> {
 /// difflib `quick_ratio` from precomputed sorted char-counts: `2·Σ min(count_a, count_b)/(|a|+|b|)`,
 /// an exact upper bound on `ratio`. Merge of two sorted multisets — O(distinct chars), no hashing.
 #[allow(clippy::cast_precision_loss)]
-fn quick_ratio_counts(ca: &[(char, u32)], cb: &[(char, u32)], total: usize) -> f64 {
+pub(crate) fn quick_ratio_counts(ca: &[(char, u32)], cb: &[(char, u32)], total: usize) -> f64 {
     if total == 0 {
         return 1.0;
     }
@@ -518,7 +522,7 @@ fn cluster_min_sim(members: &[usize], chars: &[Vec<char>], sams: &[gestalt::Sam]
 
 /// Union-find over qualifying edge pairs → clusters (size >= 2), each with its exact min intra-pair
 /// ratio. The qualifying pass's edge ratios are cached in `ratios` and reused by `cluster_min_sim`.
-fn assemble(n: usize, pairs: Vec<(usize, usize, f64)>, chars: &[Vec<char>], sams: &[gestalt::Sam]) -> Vec<(Vec<usize>, f64)> {
+pub(crate) fn assemble(n: usize, pairs: Vec<(usize, usize, f64)>, chars: &[Vec<char>], sams: &[gestalt::Sam]) -> Vec<(Vec<usize>, f64)> {
     let mut parent: Vec<usize> = (0..n).collect();
     let mut ratios: HashMap<(usize, usize), f64> = HashMap::with_capacity(pairs.len());
     for (i, j, r) in pairs {
@@ -550,6 +554,7 @@ fn assemble(n: usize, pairs: Vec<(usize, usize, f64)>, chars: &[Vec<char>], sams
 /// Exact single-linkage clustering over pre-collected `char` vectors: returns each cluster (member
 /// indices, sorted) with its exact minimum pairwise ratio. O(n²) early-exit join, rayon-parallel.
 #[must_use]
+#[doc(hidden)] // low-level Vec<char> entry — used by the bench bin + `Rationer`; prefer `cluster_canonicals`.
 pub fn cluster_canonicals_chars(chars: &[Vec<char>], threshold: f64) -> Vec<(Vec<usize>, f64)> {
     let n = chars.len();
     // Prebuild each string's suffix automaton ONCE (n builds), reused as the b-side for all n²
@@ -745,6 +750,81 @@ mod python {
         py.detach(|| run_on_threads(threads, || super::cluster_canonicals_lsh(&canonicals, threshold, num_perm, band_rows)))
     }
 
+    /// `Rationer(concurrency="gpu+cpu", threads=0, delta=0.0)` — stateful handle that owns the
+    /// long-lived backend resources (on macOS+`gpu`: Metal device + power-boost assertion) once and
+    /// reuses them across calls. The free functions rebuild per-call state each time; a `Rationer`
+    /// pays it once.
+    ///
+    /// `concurrency` ∈ `"cpu" | "gpu" | "gpu+cpu"`. The GPU is only engaged where it measured a net
+    /// win — `cluster_canonicals` on a single large group (~1.1–1.4× on Apple Silicon). `ratio` /
+    /// `ratio_many` stay on CPU. On a wheel built without the `gpu` feature (the default Linux/Windows
+    /// wheels), or with no Metal device, every call quietly runs on CPU with identical output.
+    #[pyclass(name = "Rationer")]
+    struct PyRationer {
+        inner: super::Rationer,
+    }
+
+    #[pymethods]
+    impl PyRationer {
+        #[new]
+        #[pyo3(signature = (concurrency="gpu+cpu", threads=0, delta=0.0))]
+        fn new(concurrency: &str, threads: usize, delta: f64) -> PyResult<Self> {
+            use pyo3::exceptions::PyValueError;
+            let c = match concurrency.to_ascii_lowercase().as_str() {
+                "cpu" => super::Concurrency::Cpu,
+                "gpu" => super::Concurrency::Gpu,
+                "gpu+cpu" | "gpucpu" | "gpu_cpu" => super::Concurrency::GpuPlusCpu,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown concurrency {other:?}; expected \"cpu\", \"gpu\", or \"gpu+cpu\""
+                    )))
+                }
+            };
+            let mut b = super::Rationer::builder().concurrency(c).delta(delta);
+            if threads > 0 {
+                b = b.threads(threads);
+            }
+            Ok(Self { inner: b.build() })
+        }
+
+        /// The active backend after construction-time fallback: `"cpu"`, `"gpu"`, or `"gpu+cpu"`.
+        /// A handle requested as `"gpu"` on a non-Metal build/host reports `"cpu"` here.
+        #[getter]
+        fn concurrency(&self) -> &'static str {
+            match self.inner.concurrency() {
+                super::Concurrency::Cpu => "cpu",
+                super::Concurrency::Gpu => "gpu",
+                super::Concurrency::GpuPlusCpu => "gpu+cpu",
+            }
+        }
+
+        /// Active approximate-RO `delta` (0.0 = exact).
+        #[getter]
+        fn delta(&self) -> f64 {
+            self.inner.delta()
+        }
+
+        /// Single-pair exact ratio (always CPU; one pair offers no GPU win).
+        fn ratio(&self, py: Python<'_>, a: &str, b: &str) -> f64 {
+            let (a, b) = (a.to_owned(), b.to_owned());
+            py.detach(|| self.inner.ratio(&a, &b))
+        }
+
+        /// Batched exact ratio over `(a, b)` pairs (CPU rayon; GIL released).
+        #[allow(clippy::needless_pass_by_value)]
+        fn ratio_many(&self, py: Python<'_>, pairs: Vec<(String, String)>) -> Vec<f64> {
+            py.detach(|| self.inner.ratio_many(&pairs))
+        }
+
+        /// Exact single-linkage clustering at `threshold`. Routes through the GPU on macOS+`gpu`
+        /// when the group is large enough to amortize dispatch; otherwise CPU. Same output as the
+        /// free `cluster_canonicals`.
+        #[allow(clippy::needless_pass_by_value)]
+        fn cluster_canonicals(&self, py: Python<'_>, canonicals: Vec<String>, threshold: f64) -> Vec<(Vec<usize>, f64)> {
+            py.detach(|| self.inner.cluster_canonicals(&canonicals, threshold))
+        }
+    }
+
     /// Compiled core of the `difflib_fast` Python package (re-exported by `difflib_fast/__init__.py`).
     #[pymodule]
     fn _difflib_fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -752,6 +832,7 @@ mod python {
         m.add_function(wrap_pyfunction!(ratio_many, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals_lsh, m)?)?;
+        m.add_class::<PyRationer>()?;
         Ok(())
     }
 }

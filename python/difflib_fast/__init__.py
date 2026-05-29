@@ -5,18 +5,22 @@ automaton (Rust), plus exact single-linkage clustering of a corpus.
 
 ``ratio`` is overloaded: two strings → one float; a list of ``(a, b)`` pairs → a list of floats,
 computed across all cores inside Rust (rayon, GIL released) — the contention-free way to score a batch.
+
+``Rationer`` is the stateful handle: on a macOS wheel built with the ``gpu`` feature it runs
+``cluster_canonicals`` on the Metal GPU (else CPU, identical output).
 """
 
 from typing import overload
 
 from ._difflib_fast import (
+    Rationer,
     cluster_canonicals,
     cluster_canonicals_lsh,
     ratio as _ratio,
     ratio_many as _ratio_many,
 )
 
-__all__ = ["ratio", "cluster_canonicals", "cluster_canonicals_lsh"]
+__all__ = ["ratio", "cluster_canonicals", "cluster_canonicals_lsh", "Rationer"]
 
 
 @overload
