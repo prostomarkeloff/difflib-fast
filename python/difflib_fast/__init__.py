@@ -13,14 +13,23 @@ computed across all cores inside Rust (rayon, GIL released) — the contention-f
 from typing import overload
 
 from ._difflib_fast import (
+    CosineJoiner,
     Rationer,
     cluster_canonicals,
     cluster_canonicals_lsh,
+    cosine_join,
     ratio as _ratio,
     ratio_many as _ratio_many,
 )
 
-__all__ = ["ratio", "cluster_canonicals", "cluster_canonicals_lsh", "Rationer"]
+__all__ = [
+    "ratio",
+    "cluster_canonicals",
+    "cluster_canonicals_lsh",
+    "Rationer",
+    "cosine_join",
+    "CosineJoiner",
+]
 
 
 @overload

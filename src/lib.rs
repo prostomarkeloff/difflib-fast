@@ -28,11 +28,19 @@ use rayon::prelude::*;
 pub mod gestalt;
 pub use gestalt::gestalt_ratio;
 
+// Exact all-pairs weighted-cosine similarity join (AllPairs/L2AP) — inverted index + prefix
+// filtering. The principled replacement for shingle-candidate near-duplicate detection.
+pub mod simjoin;
+
 // Heterogeneous CPU+GPU exact RO — Metal compute backend (Apple Silicon). Behind `feature = "gpu"`
 // + `cfg(target_os = "macos")`; the rest of the crate falls back to the CPU path when it's off or
 // no Metal device is available at runtime.
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 pub mod gpu;
+
+// GPU batched sparse-cosine — the offload experiment for `simjoin`'s bandwidth-bound verify step.
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+pub mod simjoin_gpu;
 
 // `Rationer` — the stateful, GPU-accelerated similarity/clustering handle. Always available;
 // degrades to CPU when the `gpu` feature is off or no Metal device can be acquired.
@@ -706,6 +714,19 @@ mod python {
         }
     }
 
+    /// Parse a `"cpu" | "gpu" | "gpu+cpu"` backend string into a [`Concurrency`](super::Concurrency).
+    fn parse_concurrency(s: &str) -> PyResult<super::Concurrency> {
+        use pyo3::exceptions::PyValueError;
+        match s.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(super::Concurrency::Cpu),
+            "gpu" => Ok(super::Concurrency::Gpu),
+            "gpu+cpu" | "gpucpu" | "gpu_cpu" => Ok(super::Concurrency::GpuPlusCpu),
+            other => Err(PyValueError::new_err(format!(
+                "unknown concurrency {other:?}; expected \"cpu\", \"gpu\", or \"gpu+cpu\""
+            ))),
+        }
+    }
+
     /// `ratio(a, b)` — fast exact `difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()`.
     ///
     /// Releases the GIL for the compute (the inputs are copied to owned `String`s first), so calling
@@ -769,17 +790,7 @@ mod python {
         #[new]
         #[pyo3(signature = (concurrency="gpu+cpu", threads=0, delta=0.0))]
         fn new(concurrency: &str, threads: usize, delta: f64) -> PyResult<Self> {
-            use pyo3::exceptions::PyValueError;
-            let c = match concurrency.to_ascii_lowercase().as_str() {
-                "cpu" => super::Concurrency::Cpu,
-                "gpu" => super::Concurrency::Gpu,
-                "gpu+cpu" | "gpucpu" | "gpu_cpu" => super::Concurrency::GpuPlusCpu,
-                other => {
-                    return Err(PyValueError::new_err(format!(
-                        "unknown concurrency {other:?}; expected \"cpu\", \"gpu\", or \"gpu+cpu\""
-                    )))
-                }
-            };
+            let c = parse_concurrency(concurrency)?;
             let mut b = super::Rationer::builder().concurrency(c).delta(delta);
             if threads > 0 {
                 b = b.threads(threads);
@@ -825,6 +836,82 @@ mod python {
         }
     }
 
+    /// `cosine_join(docs, threshold, concurrency="cpu", threads=0)` — exact all-pairs weighted-cosine
+    /// similarity join over **token documents**. Each `doc` is a list of string tokens (e.g. a
+    /// function's canonical lines); they're turned into TF-IDF sparse vectors in Rust and every pair
+    /// with cosine `>= threshold` is returned as `(j, i, cos)` with `j < i`.
+    ///
+    /// `concurrency` ∈ `"cpu" | "gpu" | "gpu+cpu"`: `"cpu"` is exact f64 everywhere; `"gpu+cpu"` is the
+    /// exact f64 GPU-accelerated hybrid (byte-identical to `"cpu"`); `"gpu"` runs the dot on the GPU in
+    /// f32 (fastest; differs from exact only on pairs within ~1e-6 of the threshold). On a wheel built
+    /// without the `gpu` feature, or with no Metal device, the GPU modes quietly fall back to CPU. The
+    /// GIL is released for the whole build+join. For repeated joins on one corpus, use `CosineJoiner`.
+    #[pyfunction]
+    #[pyo3(signature = (docs, threshold, concurrency="cpu", threads=0))]
+    #[allow(clippy::needless_pass_by_value)]
+    fn cosine_join(
+        py: Python<'_>,
+        docs: Vec<Vec<String>>,
+        threshold: f64,
+        concurrency: &str,
+        threads: usize,
+    ) -> PyResult<Vec<(usize, usize, f64)>> {
+        let mode = parse_concurrency(concurrency)?;
+        Ok(py.detach(|| {
+            run_on_threads(threads, || {
+                let corpus = super::simjoin::Corpus::from_token_docs(&docs);
+                super::simjoin::cosine_join_with(&corpus, threshold, mode)
+            })
+        }))
+    }
+
+    /// `CosineJoiner(docs)` — stateful similarity-join handle that builds the TF-IDF corpus and (on a
+    /// macOS `gpu` wheel) acquires the Metal device + uploads the corpus **once**, then answers
+    /// repeated `join(threshold, concurrency=...)` calls reusing them. The free `cosine_join` rebuilds
+    /// everything per call; a `CosineJoiner` pays it once — use it to sweep thresholds.
+    #[pyclass(name = "CosineJoiner")]
+    struct PyCosineJoiner {
+        inner: super::simjoin::CosineJoiner,
+    }
+
+    #[pymethods]
+    impl PyCosineJoiner {
+        #[new]
+        #[allow(clippy::needless_pass_by_value)]
+        fn new(py: Python<'_>, docs: Vec<Vec<String>>) -> Self {
+            let inner = py.detach(|| {
+                super::simjoin::CosineJoiner::new(super::simjoin::Corpus::from_token_docs(&docs))
+            });
+            Self { inner }
+        }
+
+        /// Number of documents in the corpus.
+        fn __len__(&self) -> usize {
+            self.inner.corpus().len()
+        }
+
+        /// Whether a Metal GPU backend was acquired (always `False` off a macOS `gpu` wheel). When
+        /// `False`, every `join` runs on CPU regardless of the `concurrency` argument.
+        #[getter]
+        fn has_gpu(&self) -> bool {
+            self.inner.has_gpu()
+        }
+
+        /// Join at `threshold` under `concurrency` (`"cpu" | "gpu" | "gpu+cpu"`), reusing the handle's
+        /// resources. Returns `(j, i, cos)` pairs with `j < i`. GIL released for the compute.
+        #[pyo3(signature = (threshold, concurrency="cpu", threads=0))]
+        fn join(
+            &self,
+            py: Python<'_>,
+            threshold: f64,
+            concurrency: &str,
+            threads: usize,
+        ) -> PyResult<Vec<(usize, usize, f64)>> {
+            let mode = parse_concurrency(concurrency)?;
+            Ok(py.detach(|| run_on_threads(threads, || self.inner.join(threshold, mode))))
+        }
+    }
+
     /// Compiled core of the `difflib_fast` Python package (re-exported by `difflib_fast/__init__.py`).
     #[pymodule]
     fn _difflib_fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -832,7 +919,9 @@ mod python {
         m.add_function(wrap_pyfunction!(ratio_many, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals, m)?)?;
         m.add_function(wrap_pyfunction!(cluster_canonicals_lsh, m)?)?;
+        m.add_function(wrap_pyfunction!(cosine_join, m)?)?;
         m.add_class::<PyRationer>()?;
+        m.add_class::<PyCosineJoiner>()?;
         Ok(())
     }
 }

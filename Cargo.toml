@@ -1,7 +1,7 @@
 [package]
 name = "difflib-fast"
-version = "0.2.0"
-description = "Fast, byte-for-byte exact difflib Ratcliff–Obershelp (gestalt) similarity ratio + single-linkage clustering, via a suffix automaton."
+version = "0.3.0"
+description = "Fast, byte-for-byte exact difflib Ratcliff–Obershelp (gestalt) similarity ratio + single-linkage clustering (suffix automaton), plus an exact all-pairs weighted-cosine similarity join (L2AP, CPU+GPU)."
 keywords = ["difflib", "similarity", "ratcliff-obershelp", "suffix-automaton", "fuzzy"]
 categories = ["algorithms", "text-processing"]
 edition = "2021"
@@ -48,6 +48,10 @@ gpu = ["dep:metal"]
 # lengths. Costs ~10-20% wall when active (relaxed-ordered atomics on the hot path); the
 # `cfg(feature)` gate compiles to a no-op in default builds so production stays untouched.
 instrument = []
+# `profiling` marks `simjoin`'s hot phases `#[inline(never)]` so the sampler (samply) attributes
+# self-time per phase (candidate-gen vs verify vs index-suffix) instead of one inlined `cosine_join`
+# blob. Pure observability — compiles to identical codegen as default when off. Never ship it.
+profiling = []
 
 # `objc`'s `sel!`/`msg_send!` macros (pulled in transitively by the `metal` crate under the `gpu`
 # feature) expand to `cfg(feature = "cargo-clippy")` checks — whitelist that cfg so the lint stays
@@ -66,6 +70,11 @@ pedantic = { level = "deny", priority = -1 }
 [[bin]]
 name = "bench"
 required-features = ["bench"]
+
+# GPU-vs-CPU throughput experiment for the simjoin verify step (Apple Metal). Needs the `gpu` feature.
+[[example]]
+name = "simjoin_gpu_bench"
+required-features = ["gpu"]
 
 # Keep symbols + line tables in release so an external sampler (samply) can resolve frames.
 [profile.release]

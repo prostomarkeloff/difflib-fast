@@ -42,7 +42,7 @@ assert_eq!(ratio("the quick brown fox", "the quick brown dog"), 0.89473684210526
 ```
 
 ```toml
-difflib-fast = "0.1"
+difflib-fast = "0.3"
 ```
 
 ---
@@ -140,7 +140,7 @@ default (the GPU paths remain opt-in via `DFGPU_RATIO_MANY_THRESHOLD` / `DFGPU_M
 the feature off, on non-macOS, or with no Metal device, every call quietly runs on CPU.
 
 ```toml
-difflib-fast = { version = "0.1", features = ["gpu"] }   # macOS only
+difflib-fast = { version = "0.3", features = ["gpu"] }   # macOS only
 ```
 
 ---
@@ -218,7 +218,7 @@ pick the wheel for you — grab the one for your platform from the
 
 ```bash
 # macOS Apple Silicon — swap the filename for your platform (see below):
-pip install https://github.com/prostomarkeloff/difflib-fast/releases/download/v0.2.0/difflib_fast-0.2.0-cp39-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/prostomarkeloff/difflib-fast/releases/download/v0.3.0/difflib_fast-0.3.0-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 | platform | wheel suffix |
@@ -295,6 +295,48 @@ On Linux/Windows wheels, or with no Metal device, a `Rationer` transparently run
 Build a GPU wheel locally on macOS with
 `maturin develop --release --features python,gpu` (the CLI `--features` **replaces** the pyproject
 default, so list both).
+
+---
+
+## Also: exact cosine similarity join (`simjoin`)
+
+The same "exact, or it's a bug" discipline, pointed at a different metric. **`simjoin`** is an exact
+all-pairs **weighted-cosine** similarity join over sparse non-negative vectors — *every* pair with
+`cos ≥ t`, no LSH, no approximation — on the provably-SOTA **L2AP** algorithm (inverted index +
+Cauchy–Schwarz prefix pruning; Anastasiu & Karypis, ICDE'14). It's the principled exact replacement for
+"shingle candidates → verify" near-duplicate detection: documents = functions, dimensions = canonical
+lines, weights = IDF — i.e. **exact Type-3 code-clone detection**.
+
+```python
+import difflib_fast as df
+
+# documents as token lists → TF-IDF in Rust → every pair with cosine ≥ 0.8
+docs = [["def _fn(_v0):", "return _v0 + 1"],
+        ["def _fn(_v0):", "return _v0 + 1"],   # an exact clone of doc 0
+        ["import os", "import sys"]]
+df.cosine_join(docs, 0.8)          # → [(0, 1, 1.0)]   tuples are (j, i, cos), j < i
+df.cosine_join(docs, 0.8, "gpu")   # same join, the dot-products run on the Metal GPU
+```
+
+Three backends, one argument (`concurrency=`) — all auto-parallel across every core (rayon, GIL
+released, exactly like `ratio`):
+
+| `concurrency` | how | result |
+|---|---|---|
+| `"cpu"` | L2AP on all cores | exact `f64` |
+| `"gpu+cpu"` | CPU prunes ~99% of candidates, GPU verifies the rest (f32 filter), CPU re-scores survivors exactly | **byte-identical to `"cpu"`** |
+| `"gpu"` | CPU prunes, GPU verifies, emit the f32 score | ε-exact (≤ 1 differing pair per **millions**) |
+
+On the real **top-300 PyPI** corpus (287,408 functions, 3.1M clone pairs found) the verify is
+memory-**bandwidth**-bound, and the Apple GPU's memory-level parallelism wins it: **53 GB/s** of
+random-gather sparse dot-products vs the CPU's 22 GB/s, so the GPU backends run the whole join
+**~1.8–2× faster than the (already L2AP-tuned) CPU**, byte-for-byte. Brute force would be ~4·10¹⁰ pairs
+(hours); this is seconds. `CosineJoiner(docs)` is the stateful handle (build corpus + GPU upload once,
+sweep thresholds); full numbers in [`benchmarks.md`](benchmarks.md#6-similarity-join-simjoin).
+
+In Rust: `difflib_fast::simjoin::{Corpus, cosine_join, cosine_join_with, CosineJoiner}` (GPU backends
+behind the `gpu` feature). Same correctness gate as the rest of the crate — the indexed join is
+asserted **bit-identical to an O(n²) brute-force oracle** on hundreds of fuzzed corpora.
 
 ---
 

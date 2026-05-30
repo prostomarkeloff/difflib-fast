@@ -44,6 +44,49 @@ def cluster_canonicals_lsh(
     ``threads=N`` caps the pool to N workers for this call (``threads=0``, default, uses every core).
     """
 
+def cosine_join(
+    docs: list[list[str]], threshold: float, concurrency: str = "cpu", threads: int = 0
+) -> list[tuple[int, int, float]]:
+    """Exact all-pairs weighted-cosine similarity join over token documents.
+
+    Each ``doc`` is a list of string tokens (e.g. a function's canonicalised lines); they're turned
+    into TF-IDF sparse vectors in Rust (dim = distinct token, weight = token-count × ``ln(n/df)``) and
+    every pair with cosine ``>= threshold`` is returned as ``(j, i, cos)`` with ``j < i``. Like
+    :func:`ratio`'s batch form, the work fans out across **all cores inside Rust with the GIL
+    released** — one call, full multicore, no ``ThreadPoolExecutor``. ``threads=N`` caps the pool to N
+    for this call; ``threads=0`` (default) uses every core (tunable via ``RAYON_NUM_THREADS``).
+
+    ``concurrency`` ∈ ``"cpu" | "gpu" | "gpu+cpu"``: ``"cpu"`` is exact f64; ``"gpu+cpu"`` is the exact
+    f64 GPU-accelerated hybrid (byte-identical to ``"cpu"``); ``"gpu"`` runs the dot on the Metal GPU
+    in f32 (fastest; differs from exact only on pairs within ~1e-6 of the threshold). Off a macOS
+    ``gpu`` wheel, or with no Metal device, the GPU modes quietly fall back to CPU. For repeated joins
+    on one corpus use :class:`CosineJoiner` (builds the corpus / uploads to the GPU once).
+    """
+
+class CosineJoiner:
+    """Stateful similarity-join handle: builds the TF-IDF corpus and (on a macOS ``gpu`` wheel)
+    acquires the Metal device + uploads the corpus once, then answers repeated joins reusing them.
+
+    Use it to sweep thresholds — the free :func:`cosine_join` rebuilds everything per call.
+    """
+
+    def __init__(self, docs: list[list[str]]) -> None:
+        """Build a joiner over token documents (each a list of string tokens)."""
+
+    def __len__(self) -> int:
+        """Number of documents in the corpus."""
+
+    @property
+    def has_gpu(self) -> bool:
+        """Whether a Metal GPU backend was acquired (always ``False`` off a macOS ``gpu`` wheel)."""
+
+    def join(
+        self, threshold: float, concurrency: str = "cpu", threads: int = 0
+    ) -> list[tuple[int, int, float]]:
+        """Join at ``threshold`` under ``concurrency`` (``"cpu" | "gpu" | "gpu+cpu"``), reusing the
+        handle's resources. Returns ``(j, i, cos)`` pairs with ``j < i``; fans out across all cores
+        with the GIL released (``threads=0`` = every core)."""
+
 class Rationer:
     """Stateful similarity/clustering handle that owns the backend resources once and reuses them.
 
