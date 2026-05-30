@@ -2,7 +2,9 @@
 
 Exact **Ratcliff–Obershelp** (Python `difflib.SequenceMatcher(..., autojunk=False).ratio()`) throughput
 and head-to-head vs every other implementation we could find. `pairs/s` = pairwise `ratio` decisions
-per second. Speedups (`Nx`) are **difflib-fast ÷ competitor**.
+per second. Speedups (`Nx`) are **difflib-fast ÷ competitor**. §1–5 + Landscape cover the RO path;
+[**§6**](#6-similarity-join-simjoin) benches the crate's other exact capability — `simjoin`, an
+all-pairs weighted-cosine similarity join (L2AP) — on a real 287k-function corpus, CPU vs GPU.
 
 ## Setup
 
@@ -270,3 +272,60 @@ exists to close.
 The libraries that beat difflib-fast outright on raw speed (RapidFuzz, strsim) do so by computing a
 **different metric** (Indel/Levenshtein), not difflib's ratio — so they aren't drop-in replacements for
 `difflib.ratio()`.
+
+---
+
+## 6. Similarity join (`simjoin`) — exact weighted-cosine
+
+A different capability in the same crate, held to the same exactness bar. **`simjoin`** is an exact
+all-pairs **weighted-cosine** similarity join over sparse non-negative vectors (every pair with
+`cos ≥ t`), on the SOTA **L2AP** algorithm — inverted index + Cauchy–Schwarz prefix-prune (Anastasiu &
+Karypis, ICDE'14). The exact replacement for shingle-candidate + verify near-duplicate detection
+(functions × IDF-weighted canonical lines = exact Type-3 clone detection). Correctness gate: the indexed
+join is **bit-identical to an `O(n²)` brute-force oracle** on fuzzed corpora — the same
+"two implementations, one answer" discipline as the RO path.
+
+**Corpus:** the real **top-300 PyPI** Type-3 snapshot — **287,408 functions**, 1.53M distinct canonical
+lines, mean 11.4 lines/function. Brute force is `287k²/2 ≈ 4·10¹⁰` pairs (hours); the join runs in
+seconds. M3 Pro (6 P + 6 E cores), 12 threads.
+
+### 6a. Full join — three backends
+
+`cosine_join` across its three `Concurrency` backends. `"cpu"` and `"gpu+cpu"` are **byte-for-byte
+identical**; `"gpu"` (pure f32) differs by ≤ 1 pair in millions — cosine is a sum of non-negative
+products, so there's no cancellation, f32 is ~1e-6 accurate, and only threshold-boundary pairs can flip:
+
+| threshold | pairs found | `cpu` (exact f64) | `gpu+cpu` (exact f64) | `gpu` (f32) |
+|---|---|---|---|---|
+| 0.8 | 3,115,369 | 2.9–3.5 s | **1.6–2.0 s · ~1.8×** | 1.6 s · 1.9× |
+| 0.7 | 4,427,097 | 4.6–5.2 s | 2.4 s · 1.9× | **2.3 s · 2.0×** |
+
+(`gpu` differed from exact by **1 pair of 3,115,369** at t=0.8, **0 of 4,427,097** at t=0.7; max cosine
+gap on shared pairs 8.8e-7.)
+
+### 6b. Why the GPU wins — the verify is bandwidth-bound
+
+The join's dominant cost is the **verify**: ~10⁸ candidate pairs, each an `O(nnz)` sparse dot that
+gathers two random CSR rows. With every core gathering at once it's memory-**bandwidth**-bound (not
+compute), and the Apple GPU sustains far more in-flight memory requests against the same unified-memory
+pool. Measured on 20M random sparse-dot pairs (173 B/pair, f32):
+
+| backend | throughput | effective gather bandwidth | % of ~150 GB/s peak |
+|---|---|---|---|
+| GPU (Metal, incl. pair upload) | 309 M pairs/s | **53 GB/s** | ~36% |
+| CPU rayon (12 threads) | 126 M pairs/s | 22 GB/s | ~14% |
+| CPU serial | 17 M pairs/s | 2.9 GB/s | ~2% |
+
+GPU f32 matches CPU f32 to **6e-8** (the kernel is correct). On a scatter pattern, 36% of peak is the
+GPU's memory-level-parallelism edge — the CPU stalls on each random gather where the GPU keeps hundreds
+in flight.
+
+**Honest read.** The hardware (Metal) is **f32-only** — no `double` — so a GPU dot can't be
+bit-identical to the CPU `f64`. `gpu+cpu` works around it: the GPU f32 dot is a *conservative filter*
+(it rejects only what's clearly below `t`), and the CPU recomputes the exact `f64` score on the ~3% of
+survivors that pass — so the pair set + scores are byte-identical to `cpu`. The `gpu` backend skips the
+re-verify and emits f32 (≤1 differing pair per millions, immaterial at a similarity threshold). The CPU
+backend itself is already L2AP-tuned to the bandwidth wall — branchless sorted-merge dot, cache-packed
+prune state, full-index-then-parallel-probe — so the GPU's ~2× sits on top of an already-fast baseline
+(itself ~23× over a naive inverted-index join on synthetic Zipfian data). Methodology + Metal kernel:
+[`examples/simjoin_gpu_bench.rs`](examples/simjoin_gpu_bench.rs), `src/simjoin_gpu.rs`.
