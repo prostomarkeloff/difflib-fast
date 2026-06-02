@@ -218,7 +218,7 @@ pick the wheel for you — grab the one for your platform from the
 
 ```bash
 # macOS Apple Silicon — swap the filename for your platform (see below):
-pip install https://github.com/prostomarkeloff/difflib-fast/releases/download/v0.3.0/difflib_fast-0.3.0-cp39-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/prostomarkeloff/difflib-fast/releases/download/v0.3.5/difflib_fast-0.3.5-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 | platform | wheel suffix |

@@ -55,7 +55,16 @@ fn main() {
     let t: f64 = arg(2, 0.8);
     let reps: usize = arg(3, 3);
 
-    let rows = load(&path);
+    let mut rows = load(&path);
+    // Optional row subset (SJ_NSUB) to bench the small-corpus regime (e.g. find-dup-defs scale
+    // ~3216 functions) instead of the full 287k bandwidth-bound regime.
+    if let Ok(nsub) = std::env::var("SJ_NSUB") {
+        if let Ok(k) = nsub.parse::<usize>() {
+            if rows.len() > k {
+                rows.truncate(k);
+            }
+        }
+    }
     let n = rows.len();
     let nnz: usize = rows.iter().map(Vec::len).sum();
 
