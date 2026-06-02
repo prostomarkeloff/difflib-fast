@@ -424,13 +424,34 @@ impl CosineJoiner {
 /// `1e-9 ≫` the `~1e-15` accumulated error over ~15 terms.
 const PRUNE_SLACK: f64 = 1e-9;
 
+/// Probe row length at/above which the cheap monotone pre-bound in [`verify_pruned`] is worth it.
+/// The pre-bound skips the per-candidate `partition_point` for candidates that can't reach `t`, but
+/// `partition_point` over a *short* probe row is already cheap, so on sparse corpora (mean nnz ≈ 11,
+/// e.g. `PyPI` type3) the pre-bound's own `fmul`/`fadd`/compare is pure overhead that rarely prunes
+/// (match-dense ⇒ high survivor rate). It only pays on **dense** rows (e.g. find-dup-defs
+/// patternology, mean nnz ≈ 61) where `partition_point` is costly and the survivor rate is tiny.
+/// Gating on `di.len()` (a per-probe, loop-invariant test) keeps the sparse regime regression-free.
+const PREBOUND_MIN_DIMS: usize = 24;
+
 /// Phase 1 — accumulate: for each indexed dim of the probe, add `w_probe·w_y` into `acc[y]` for
 /// every **earlier** `y` (`y < cutoff`, the probe's own id) indexing that dim. Postings are id-sorted,
 /// so we `break` at the first `y ≥ cutoff`. Leaves `acc` `-1.0` everywhere except the touched ids
 /// (listed in `touched`, reset in [`verify_pruned`]). One scattered `acc[]` FMA per posting.
 #[cfg_attr(feature = "profiling", inline(never))]
 fn accumulate(index: &[Vec<(u32, f64)>], (di, wi): (&[u32], &[f64]), cutoff: u32, s: &mut Scratch) {
-    s.touched.clear();
+    // Split the borrows so `acc` and `touched` are independent: otherwise the optimiser, seeing
+    // `s.touched.push(...)` go through the same `&mut Scratch`, can't prove the push leaves
+    // `s.acc`'s base pointer untouched and reloads `acc.ptr` from the struct on EVERY posting entry
+    // (one extra load across the ~5M-entry accumulation on dense corpora). With `acc` a separate
+    // `&mut [f64]` local the base stays in a register; a `touched` realloc can't alias it.
+    let Scratch { acc, touched, .. } = s;
+    let acc = acc.as_mut_slice();
+    touched.clear();
+    // At most one distinct candidate per acc slot, so `n == acc.len()` slots is enough headroom to
+    // append every first-touch without bounds checks or a realloc inside the loop.
+    touched.reserve(acc.len());
+    let tptr = touched.as_mut_ptr();
+    let mut tlen = 0usize;
     for (&d, &w) in di.iter().zip(wi) {
         for &(y, wy) in &index[d as usize] {
             if y >= cutoff {
@@ -438,14 +459,23 @@ fn accumulate(index: &[Vec<(u32, f64)>], (di, wi): (&[u32], &[f64]), cutoff: u32
             }
             let yu = y as usize;
             // SAFETY: `y` is a vector id pushed by `index_suffix`, so `yu < n == acc.len()`.
-            let a = unsafe { s.acc.get_unchecked_mut(yu) };
-            if *a < 0.0 {
-                *a = 0.0;
-                s.touched.push(y);
-            }
-            *a += w * wy;
+            let a = unsafe { acc.get_unchecked_mut(yu) };
+            // Branchless first-touch: the `*a < 0.0` test fed a data-dependent branch that mispredicts
+            // (first-touch vs repeat interleave unpredictably across the probe's dims). Instead select
+            // the base (`0.0` on first touch, current partial dot otherwise) with a conditional move,
+            // and append `y` to `touched` by an UNCONDITIONAL store that's only *committed* when the
+            // length is bumped — `tlen += first`. Same accumulator values and same touched order as
+            // the branchy form, so the result is bit-identical; just no mispredicting branch.
+            let first = *a < 0.0;
+            let base = if first { 0.0 } else { *a };
+            *a = base + w * wy;
+            // SAFETY: `tlen ≤ distinct candidates so far < acc.len() ≤ touched.capacity()`.
+            unsafe { *tptr.add(tlen) = y };
+            tlen += usize::from(first);
         }
     }
+    // SAFETY: `tlen` first-touch stores were written into the reserved region, in order.
+    unsafe { touched.set_len(tlen) };
 }
 
 /// Phase 2 — prune + verify. For each touched candidate `y`, reset its accumulator and test the
@@ -474,6 +504,13 @@ fn verify_pruned(
         sq += w * w;
         s.xpn.push(sq.sqrt());
     }
+    // `‖probe‖` = the full prefix norm. Since `xpn` is monotonic, `xpn[kstar] ≤ xnorm` for every
+    // candidate, so `a + xnorm·pnorm ≥ a + xpn[kstar]·pnorm` (the exact bound). A candidate failing
+    // the cheap `a + xnorm·pnorm < need` test therefore also fails the exact bound — prune it without
+    // the per-candidate `partition_point`. The survivor set is bit-identical; only the binary search
+    // is skipped for the ~99% of touched candidates that can't reach `t` on dense corpora.
+    let xnorm = sq.sqrt();
+    let prebound = di.len() >= PREBOUND_MIN_DIMS;
     let need = t - PRUNE_SLACK;
     let Scratch { acc, touched, xpn } = s;
     // (Software-prefetching the candidate row a few ahead was tried + reverted: no measurable change
@@ -485,6 +522,11 @@ fn verify_pruned(
         let a = unsafe { std::mem::replace(acc.get_unchecked_mut(yu), -1.0) };
         // SAFETY: `yu < n`. One scattered load fetches both prune fields.
         let bd = unsafe { *cached.bound.get_unchecked(yu) };
+        // Cheap monotone pre-bound (dense rows only) — skip the binary search when even `xnorm`
+        // can't clear `need`. `prebound` is loop-invariant, so sparse rows pay nothing.
+        if prebound && a + xnorm * bd.pnorm < need {
+            continue;
+        }
         // Number of probe dims with rank < split[y] → index into xpn (di sorted ascending).
         let kstar = di.partition_point(|&d| d < bd.split);
         // SAFETY: kstar ≤ di.len() == wi.len() = xpn.len()-1.
@@ -562,6 +604,8 @@ fn collect_survivors(c: &Corpus, i: usize, t: f64, s: &mut Scratch, cached: &Cac
         sq += w * w;
         s.xpn.push(sq.sqrt());
     }
+    let xnorm = sq.sqrt();
+    let prebound = di.len() >= PREBOUND_MIN_DIMS;
     let need = t - PRUNE_SLACK;
     let Scratch { acc, touched, xpn } = s;
     for &y in touched.iter() {
@@ -569,6 +613,10 @@ fn collect_survivors(c: &Corpus, i: usize, t: f64, s: &mut Scratch, cached: &Cac
         // SAFETY: `yu < n` (same provenance as in `accumulate`).
         let a = unsafe { std::mem::replace(acc.get_unchecked_mut(yu), -1.0) };
         let bd = unsafe { *cached.bound.get_unchecked(yu) };
+        // Cheap monotone pre-bound (see `verify_pruned`) — same survivor set, skips the binary search.
+        if prebound && a + xnorm * bd.pnorm < need {
+            continue;
+        }
         let kstar = di.partition_point(|&d| d < bd.split);
         let bound = a + unsafe { xpn.get_unchecked(kstar) } * bd.pnorm;
         if bound >= need {
@@ -700,10 +748,15 @@ pub fn cosine_join_counts(c: &Corpus, t: f64) -> (u64, u64, u64) {
             sq += w * w;
             s.xpn.push(sq.sqrt());
         }
+        let xnorm = sq.sqrt();
+        let prebound = di.len() >= PREBOUND_MIN_DIMS;
         for &y in &s.touched {
             let yu = y as usize;
             let a = std::mem::replace(&mut s.acc[yu], -1.0);
             let bd = cached.bound[yu];
+            if prebound && a + xnorm * bd.pnorm < need {
+                continue;
+            }
             let kstar = di.partition_point(|&d| d < bd.split);
             if a + s.xpn[kstar] * bd.pnorm >= need {
                 survivors += 1;
