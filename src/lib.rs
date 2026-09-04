@@ -10,9 +10,11 @@
 //! difference between difflib's pathological case and a linear scan.
 //!
 //! Beyond the per-pair ratio, [`cluster_canonicals`] does an exact single-linkage **clustering** of a
-//! corpus at a similarity threshold — prebuild each string's automaton once, then an early-exit
-//! all-pairs join (length blocking + `quick_ratio` filter + threshold-aware RO), in parallel via
-//! rayon — and reports each cluster with its exact minimum pairwise ratio. [`cluster_canonicals_lsh`]
+//! corpus at a similarity threshold — length blocking + `quick_ratio` filter, then only the edges
+//! that connect the components are decided (most-similar-first batches over a union-find), on
+//! automata built only for the strings actually scanned, in parallel via rayon — and reports each
+//! cluster with its exact minimum pairwise ratio, computed under the cluster's running minimum as a
+//! cap. [`cluster_canonicals_lsh`]
 //! is the scalable `MinHash`-LSH variant (candidate generation + exact verification) for very large
 //! corpora past the O(n²) wall.
 //!
@@ -396,6 +398,24 @@ pub(crate) fn real_quick_ratio(a: &[char], b: &[char]) -> f64 {
 /// Sorted `(char, count)` multiset of `a` — precomputed once per string so the `quick_ratio`
 /// upper-bound filter is a linear merge over the (small) alphabet instead of a per-pair `HashMap`.
 pub(crate) fn char_counts(a: &[char]) -> Vec<(char, u32)> {
+    // ASCII (canonical code, nearly always): one histogram pass instead of a sort.
+    let mut hist = [0u32; 128];
+    if a.iter().all(|&c| {
+        let u = c as usize;
+        if u < 128 {
+            hist[u] += 1;
+            true
+        } else {
+            false
+        }
+    }) {
+        return hist
+            .iter()
+            .enumerate()
+            .filter(|&(_, &k)| k > 0)
+            .map(|(i, &k)| (char::from(u8::try_from(i).expect("ascii")), k))
+            .collect();
+    }
     let mut v = a.to_vec();
     v.sort_unstable();
     let mut out: Vec<(char, u32)> = Vec::new();
@@ -438,6 +458,14 @@ fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
     x
 }
 
+fn uf_find32(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize];
+        x = parent[x as usize];
+    }
+    x
+}
+
 // Env-gated diagnostics: set DIFFLIB_FAST_PROGRESS=1 to stream phase timings + progress to stderr
 // from inside the Rust hot path (off in production — zero output, ~zero cost).
 fn progress_on() -> bool {
@@ -446,115 +474,329 @@ fn progress_on() -> bool {
 
 // ───────────────────────────────────── exact clustering ─────────────────────────────────────
 
-/// Qualifying pairs `(i<j, ratio)` with `ratio >= threshold`, in parallel. The exact upper-bound
-/// early-exits (`real_quick_ratio`/`quick_ratio`) skip most pairs without the full O(len²) RO;
-/// survivors go through `gestalt_edge` — reject early-exit for non-edges, exact ratio for edges. The
-/// edge ratio is kept so `min_sim` reuses it (a dense cluster's intra pairs are ~all edges, so the
-/// `min_sim` pass recomputes almost nothing — removing the redundant second scan over the same pairs).
-#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
-fn qualifying_pairs(chars: &[Vec<char>], sams: &[gestalt::Sam], threshold: f64) -> Vec<(usize, usize, f64)> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+/// Below this many strings (or candidate pairs) a clustering call runs on the calling thread:
+/// the rayon fan-out costs more than the work, and the caller is usually already parallel over
+/// many such calls.
+const SERIAL_BELOW: usize = 32;
 
-    let n = chars.len();
-    let rows = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        if progress_on() {
-            let rows = &rows;
-            scope.spawn(move || {
-                while rows.load(Ordering::Relaxed) < n {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let done = rows.load(Ordering::Relaxed);
-                    eprintln!("    [difflib-fast] qualifying_pairs: row {done}/{n} ({:.0}%)", done as f64 / n as f64 * 100.0);
-                }
-            });
-        }
-        // Length blocking: ratio>=T ⟹ |short|/|long| >= T/(2-T), so in length-sorted order each
-        // string only reaches a contiguous run of (not-too-much-longer) strings — break the inner
-        // loop as soon as `real_quick_ratio` drops below T. Turns the O(n²) enumeration into
-        // O(n·window); exact (never drops a qualifying pair). `counts` feeds the cheap quick filter.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| chars[i].len());
-        let counts: Vec<Vec<(char, u32)>> = chars.par_iter().map(|c| char_counts(c)).collect();
-        let pairs = (0..n)
-            .into_par_iter()
-            .flat_map_iter(|p| {
-                let i = order[p];
-                let a = &chars[i];
-                let mut local: Vec<(usize, usize, f64)> = Vec::new();
-                for &j in &order[p + 1..] {
-                    let b = &chars[j];
-                    if real_quick_ratio(a, b) < threshold {
-                        break; // lengths only grow ⇒ all remaining partners also fail the bound
-                    }
-                    if quick_ratio_counts(&counts[i], &counts[j], a.len() + b.len()) < threshold {
-                        continue;
-                    }
-                    let (lo, hi) = if i < j { (i, j) } else { (j, i) };
-                    // Reject early-exit for non-edges; exact ratio (cached for min_sim) for edges.
-                    if let Some(r) = gestalt::gestalt_edge(&chars[lo], &chars[hi], &sams[hi], threshold) {
-                        local.push((lo, hi, r));
-                    }
-                }
-                rows.fetch_add(1, Ordering::Relaxed);
-                local
-            })
-            .collect();
-        rows.store(n, Ordering::Relaxed); // unblock the progress thread
-        pairs
-    })
+/// The strings' suffix automata, built on first use. A pair `(lo, hi)` scans `lo` against
+/// `hi`'s automaton, so only the strings that are the `hi` side of some pair that reaches the
+/// scan ever need one — in a group of two that is one automaton, not two, and the build is the
+/// single most expensive step per string.
+pub(crate) struct LazySams<'a> {
+    chars: &'a [Vec<char>],
+    cells: Vec<std::sync::OnceLock<gestalt::Sam>>,
 }
 
-/// Min intra-cluster pairwise ratio (single-linkage's conservative figure), exact. Edge pairs are
-/// already in `ratios` (cached from the qualifying pass) — for a dense cluster that is ~every intra
-/// pair, so almost nothing is recomputed. The rare missing (non-edge, ratio < threshold) pair is
-/// computed with the pruned `gestalt_ratio_capped` (accept-exits any pair above the running min).
-/// Parallel over members; each task's cap is its own running min (>= the global min ⇒ exact min kept).
-fn cluster_min_sim(members: &[usize], chars: &[Vec<char>], sams: &[gestalt::Sam], ratios: &HashMap<(usize, usize), f64>) -> f64 {
-    members
-        .par_iter()
-        .enumerate()
-        .map(|(pos, &i)| {
-            let mut local = 1.0_f64;
-            for &j in &members[pos + 1..] {
-                let key = if i < j { (i, j) } else { (j, i) };
-                let r = match ratios.get(&key) {
-                    Some(&r) => r, // edge ratio cached by the qualifying pass — no recompute
-                    None => gestalt::gestalt_ratio_capped(&chars[key.0], &chars[key.1], &sams[key.1], local),
-                };
-                local = local.min(r);
+impl<'a> LazySams<'a> {
+    pub(crate) fn new(chars: &'a [Vec<char>]) -> Self {
+        Self { chars, cells: (0..chars.len()).map(|_| std::sync::OnceLock::new()).collect() }
+    }
+
+    /// Wrap automata that already exist (the GPU paths build every one up front).
+    pub(crate) fn built(chars: &'a [Vec<char>], sams: Vec<gestalt::Sam>) -> Self {
+        debug_assert_eq!(chars.len(), sams.len());
+        Self { chars, cells: sams.into_iter().map(std::sync::OnceLock::from).collect() }
+    }
+
+    pub(crate) fn get(&self, i: usize) -> &gestalt::Sam {
+        self.cells[i].get_or_init(|| gestalt::build_sam(&self.chars[i]))
+    }
+}
+
+/// Candidate pairs `(lo, hi)`, `lo < hi`, that survive the two exact upper bounds. Length
+/// blocking: ratio>=T ⟹ |short|/|long| >= T/(2-T), so in length-sorted order each string only
+/// reaches a contiguous run of (not-too-much-longer) strings — the inner loop breaks as soon as
+/// `real_quick_ratio` drops below T. Then the char-multiset `quick_ratio`. Together they kill
+/// 70–90 % of pairs without a scan, and never drop a qualifying pair.
+#[allow(clippy::cast_possible_truncation)]
+fn candidate_pairs(chars: &[Vec<char>], counts: &[Vec<(char, u32)>], threshold: f64) -> Vec<(u32, u32)> {
+    let n = chars.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| chars[i].len());
+    let row = |p: usize, local: &mut Vec<(u32, u32)>| {
+        let i = order[p];
+        let a = &chars[i];
+        for &j in &order[p + 1..] {
+            let b = &chars[j];
+            if real_quick_ratio(a, b) < threshold {
+                break; // lengths only grow ⇒ all remaining partners also fail the bound
             }
+            if quick_ratio_counts(&counts[i], &counts[j], a.len() + b.len()) < threshold {
+                continue;
+            }
+            let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+            local.push((lo as u32, hi as u32));
+        }
+    };
+    if n < SERIAL_BELOW {
+        let mut out = Vec::new();
+        for p in 0..n {
+            row(p, &mut out);
+        }
+        return out;
+    }
+    (0..n)
+        .into_par_iter()
+        .flat_map_iter(|p| {
+            let mut local = Vec::new();
+            row(p, &mut local);
             local
         })
-        .reduce(|| 1.0_f64, f64::min)
+        .collect()
 }
 
+/// The edges that connect the clusters: a subset of the qualifying pairs `(i<j, ratio >= T)` with
+/// the same connected components — which is all single-linkage clustering needs from them.
+///
+/// The exact edge test is the expensive step (a scan plus the recursion, and a rejected pair whose
+/// ratio is anywhere near the threshold runs most of the recursion before the bound closes). But
+/// once two strings are known to be in one component, whether their own pair is an edge changes
+/// nothing: the component is the same, and the cluster's minimum is taken over every intra pair
+/// anyway, by a capped computation that is far cheaper than an edge test. So the candidates are
+/// visited most-similar-first (by their `quick_ratio` bound) in batches — each batch tested in
+/// parallel, its edges merged into a union-find before the next — and a pair already connected
+/// by then is not tested at all. A dense cluster of `k` strings costs about `k` tests instead of
+/// `k²/2`, and its chained non-edges are never rejected the hard way.
+///
+/// A call with a single candidate computes that pair's exact ratio instead (`Some`): it is the
+/// cluster's minimum, and deciding the edge only to scan again would cost more.
+#[allow(clippy::cast_possible_truncation)]
+fn spanning_edges(
+    chars: &[Vec<char>],
+    counts: &[Vec<(char, u32)>],
+    sams: &LazySams<'_>,
+    mut cand: Vec<(u32, u32)>,
+    threshold: f64,
+) -> Vec<(usize, usize, Option<f64>)> {
+    if let [(lo, hi)] = cand[..] {
+        let (lo, hi) = (lo as usize, hi as usize);
+        return gestalt::gestalt_edge(&chars[lo], &chars[hi], sams.get(hi), threshold)
+            .map(|r| (lo, hi, Some(r)))
+            .into_iter()
+            .collect();
+    }
+    // most similar first: the quick_ratio bound descending, then the pair for determinism
+    let bound = |&(lo, hi): &(u32, u32)| {
+        let (lo, hi) = (lo as usize, hi as usize);
+        quick_ratio_counts(&counts[lo], &counts[hi], chars[lo].len() + chars[hi].len()).to_bits()
+    };
+    let mut keyed: Vec<(u64, u32, u32)> = cand.iter().map(|p| (u64::MAX - bound(p), p.0, p.1)).collect();
+    keyed.sort_unstable();
+    cand.clear();
+    cand.extend(keyed.iter().map(|&(_, lo, hi)| (lo, hi)));
+    drop(keyed);
+
+    let mut parent: Vec<u32> = (0..chars.len() as u32).collect();
+    let find = uf_find32;
+    let edge = |&(lo, hi): &(u32, u32)| {
+        let (lo, hi) = (lo as usize, hi as usize);
+        gestalt::gestalt_edge_bounded(&chars[lo], &chars[hi], sams.get(hi), threshold)
+    };
+    let mut edges: Vec<(usize, usize, Option<f64>)> = Vec::new();
+    if cand.len() < SERIAL_BELOW {
+        for &(lo, hi) in &cand {
+            let (rl, rh) = (find(&mut parent, lo), find(&mut parent, hi));
+            if rl != rh && edge(&(lo, hi)) {
+                parent[rl as usize] = rh;
+                edges.push((lo as usize, hi as usize, None));
+            }
+        }
+        return edges;
+    }
+    let total = cand.len();
+    let mut pos = 0;
+    // the first batch is sized so a large call keeps every worker busy from the start
+    let mut batch = (total / 16).clamp(SERIAL_BELOW, 256);
+    let mut todo: Vec<(u32, u32)> = Vec::new();
+    let progress = progress_on();
+    while pos < total {
+        let end = (pos + batch).min(total);
+        todo.clear();
+        for &(lo, hi) in &cand[pos..end] {
+            if find(&mut parent, lo) != find(&mut parent, hi) {
+                todo.push((lo, hi));
+            }
+        }
+        pos = end;
+        batch = (batch * 2).min(EDGE_BATCH_MAX);
+        if todo.is_empty() {
+            continue;
+        }
+        // consecutive pairs share the automaton being scanned
+        todo.sort_unstable_by_key(|&(lo, hi)| (hi, lo));
+        let found: Vec<(u32, u32)> = if todo.len() < SERIAL_BELOW {
+            todo.iter().filter(|p| edge(p)).copied().collect()
+        } else {
+            // the automata this batch scans, built up front so no worker waits on another's build
+            let mut need: Vec<u32> = todo.iter().map(|p| p.1).collect();
+            need.dedup();
+            need.par_iter().for_each(|&hi| {
+                sams.get(hi as usize);
+            });
+            todo.par_iter().filter(|p| edge(p)).copied().collect()
+        };
+        for &(lo, hi) in &found {
+            let (rl, rh) = (find(&mut parent, lo), find(&mut parent, hi));
+            if rl != rh {
+                parent[rl as usize] = rh;
+            }
+            edges.push((lo as usize, hi as usize, None));
+        }
+        if progress {
+            #[allow(clippy::cast_precision_loss)]
+            let pct = pos as f64 / total as f64 * 100.0;
+            eprintln!("    [difflib-fast] edges: {pos}/{total} candidates ({pct:.0}%), {} tested, {} edges", todo.len(), edges.len());
+        }
+    }
+    edges
+}
+
+/// Largest batch of candidate pairs tested between two union-find merges in [`spanning_edges`].
+const EDGE_BATCH_MAX: usize = 2048;
+
 /// Union-find over qualifying edge pairs → clusters (size >= 2), each with its exact min intra-pair
-/// ratio. The qualifying pass's edge ratios are cached in `ratios` and reused by `cluster_min_sim`.
-pub(crate) fn assemble(n: usize, pairs: Vec<(usize, usize, f64)>, chars: &[Vec<char>], sams: &[gestalt::Sam]) -> Vec<(Vec<usize>, f64)> {
+/// ratio.
+///
+/// The min is exact and cheap to certify: an intra pair without a cached exact ratio is computed
+/// with `gestalt_ratio_capped` against the cluster's **shared** running minimum — the function
+/// returns the exact ratio when it is at or below the cap and accept-exits the instant the pair
+/// is proven above it. The pair that IS the
+/// minimum is always at or below every cap it can meet, so it is always computed exactly; every
+/// other pair is either exact or provably not the minimum. Hence the result equals the minimum
+/// over all pairs' exact ratios, whatever order the pairs are visited in.
+///
+/// To make the cap bite early, each cluster's uncached pairs are ordered by their `quick_ratio`
+/// (an upper bound: the pair with the smallest bound has the smallest ratio ceiling), the first
+/// one is computed alone so its exact value seeds the cap, and the rest run in parallel from there.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+pub(crate) fn assemble(
+    n: usize,
+    edges: Vec<(usize, usize, Option<f64>)>,
+    chars: &[Vec<char>],
+    sams: &LazySams<'_>,
+) -> Vec<(Vec<usize>, f64)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     let mut parent: Vec<usize> = (0..n).collect();
-    let mut ratios: HashMap<(usize, usize), f64> = HashMap::with_capacity(pairs.len());
-    for (i, j, r) in pairs {
-        ratios.insert((i, j), r);
+    for &(i, j, _) in &edges {
         let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
         if ri != rj {
             parent[ri] = rj;
         }
     }
-    let mut comps: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..n {
-        let root = uf_find(&mut parent, i);
-        comps.entry(root).or_default().push(i);
-    }
-    let mut out: Vec<(Vec<usize>, f64)> = Vec::new();
-    for members in comps.values() {
-        if members.len() < 2 {
-            continue;
+    let root: Vec<usize> = (0..n).map(|i| uf_find(&mut parent, i)).collect();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_unstable_by_key(|&i| (root[i], i));
+    // clusters = runs of one root, members ascending; `cid[i]` = the cluster of member i
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let mut cid: Vec<usize> = vec![usize::MAX; n];
+    let mut start = 0;
+    while start < n {
+        let mut end = start + 1;
+        while end < n && root[idx[end]] == root[idx[start]] {
+            end += 1;
         }
-        let min_sim = cluster_min_sim(members, chars, sams, &ratios);
-        let mut sorted = members.clone();
-        sorted.sort_unstable();
-        out.push((sorted, min_sim));
+        if end - start >= 2 {
+            for &i in &idx[start..end] {
+                cid[i] = clusters.len();
+            }
+            clusters.push(idx[start..end].to_vec());
+        }
+        start = end;
     }
+    if clusters.is_empty() {
+        return Vec::new();
+    }
+    // every edge lies inside one cluster; the ones that carry their exact ratio are that
+    // cluster's cached evidence, the others are computed like any other intra pair
+    let mut cl_edges: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); clusters.len()];
+    for (i, j, r) in edges {
+        if let Some(r) = r {
+            cl_edges[cid[i]].push((i, j, r));
+        }
+    }
+    // the running minimum per cluster, as f64 bits: ratios are non-negative, so their bit
+    // patterns order like the values and `fetch_min` is a float min
+    let caps: Vec<AtomicU64> = clusters.iter().map(|_| AtomicU64::new(1.0_f64.to_bits())).collect();
+    // the intra pairs without a cached ratio: (cluster, lo, hi)
+    let mut jobs: Vec<(u32, u32, u32)> = Vec::new();
+    for (k, members) in clusters.iter().enumerate() {
+        let es = &mut cl_edges[k];
+        es.sort_unstable_by_key(|e| (e.0, e.1));
+        let mut cmin = 1.0_f64;
+        for e in es.iter() {
+            cmin = cmin.min(e.2);
+        }
+        caps[k].store(cmin.to_bits(), Ordering::Relaxed);
+        if es.len() == members.len() * (members.len() - 1) / 2 {
+            continue; // every pair carries its exact ratio
+        }
+        let mut e = 0;
+        for (pi, &i) in members.iter().enumerate() {
+            for &j in &members[pi + 1..] {
+                if e < es.len() && es[e].0 == i && es[e].1 == j {
+                    e += 1;
+                    continue;
+                }
+                jobs.push((k as u32, i as u32, j as u32));
+            }
+        }
+    }
+    if !jobs.is_empty() {
+        // order each cluster's jobs by the quick_ratio bound, ascending
+        let mut involved = vec![false; n];
+        for &(_, i, j) in &jobs {
+            involved[i as usize] = true;
+            involved[j as usize] = true;
+        }
+        let counts: Vec<Vec<(char, u32)>> = if jobs.len() < SERIAL_BELOW {
+            (0..n).map(|i| if involved[i] { char_counts(&chars[i]) } else { Vec::new() }).collect()
+        } else {
+            (0..n).into_par_iter().map(|i| if involved[i] { char_counts(&chars[i]) } else { Vec::new() }).collect()
+        };
+        let bound = |&(_, i, j): &(u32, u32, u32)| {
+            let (i, j) = (i as usize, j as usize);
+            quick_ratio_counts(&counts[i], &counts[j], chars[i].len() + chars[j].len())
+        };
+        let mut keyed: Vec<(u32, u64, u32, u32)> =
+            jobs.iter().map(|job| (job.0, bound(job).to_bits(), job.1, job.2)).collect();
+        keyed.sort_unstable();
+        let run = |&(cluster, _, lo, hi): &(u32, u64, u32, u32)| {
+            let (cluster, lo, hi) = (cluster as usize, lo as usize, hi as usize);
+            let cap = f64::from_bits(caps[cluster].load(Ordering::Relaxed));
+            let ratio = gestalt::gestalt_ratio_capped(&chars[lo], &chars[hi], sams.get(hi), cap);
+            caps[cluster].fetch_min(ratio.to_bits(), Ordering::Relaxed);
+        };
+        // seed every cluster's cap with its lowest-bound pair, then the rest with the caps live
+        let mut first: Vec<(u32, u64, u32, u32)> = Vec::new();
+        let mut rest: Vec<(u32, u64, u32, u32)> = Vec::with_capacity(keyed.len());
+        for job in keyed {
+            if first.last().is_none_or(|f| f.0 != job.0) {
+                first.push(job);
+            } else {
+                rest.push(job);
+            }
+        }
+        if first.len() + rest.len() < SERIAL_BELOW {
+            first.iter().for_each(run);
+            rest.iter().for_each(run);
+        } else {
+            let mut need: Vec<u32> = rest.iter().map(|j| j.3).collect();
+            need.par_sort_unstable();
+            need.dedup();
+            need.par_iter().for_each(|&hi| {
+                sams.get(hi as usize);
+            });
+            first.par_iter().for_each(run);
+            rest.par_iter().for_each(run);
+        }
+    }
+    let mut out: Vec<(Vec<usize>, f64)> = clusters
+        .into_iter()
+        .zip(caps)
+        .map(|(members, cap)| (members, f64::from_bits(cap.into_inner())))
+        .collect();
     out.sort_by(|a, b| a.0[0].cmp(&b.0[0]));
     out
 }
@@ -565,11 +807,18 @@ pub(crate) fn assemble(n: usize, pairs: Vec<(usize, usize, f64)>, chars: &[Vec<c
 #[doc(hidden)] // low-level Vec<char> entry — used by the bench bin + `Rationer`; prefer `cluster_canonicals`.
 pub fn cluster_canonicals_chars(chars: &[Vec<char>], threshold: f64) -> Vec<(Vec<usize>, f64)> {
     let n = chars.len();
-    // Prebuild each string's suffix automaton ONCE (n builds), reused as the b-side for all n²
-    // pairs — the all-pairs cost becomes n builds + n² scans, not n² builds.
-    let sams: Vec<gestalt::Sam> = chars.par_iter().map(|c| gestalt::build_sam(c)).collect();
-    let pairs = qualifying_pairs(chars, &sams, threshold);
-    assemble(n, pairs, chars, &sams)
+    if n < 2 {
+        return Vec::new();
+    }
+    let counts: Vec<Vec<(char, u32)>> = if n < SERIAL_BELOW {
+        chars.iter().map(|c| char_counts(c)).collect()
+    } else {
+        chars.par_iter().map(|c| char_counts(c)).collect()
+    };
+    let cand = candidate_pairs(chars, &counts, threshold);
+    let sams = LazySams::new(chars);
+    let edges = spanning_edges(chars, &counts, &sams, cand, threshold);
+    assemble(n, edges, chars, &sams)
 }
 
 /// `cluster_canonicals(canonicals, threshold)` → `[(member indices, min pairwise ratio)]`.
@@ -683,16 +932,17 @@ pub fn cluster_canonicals_lsh(canonicals: &[String], threshold: f64, num_perm: u
     }
     let sams: Vec<gestalt::Sam> = chars.par_iter().map(|c| gestalt::build_sam(c)).collect();
     let cand: Vec<(usize, usize)> = candidates.into_iter().collect();
-    let pairs: Vec<(usize, usize, f64)> = cand
+    let pairs: Vec<(usize, usize, Option<f64>)> = cand
         .par_iter()
         .filter_map(|&(i, j)| {
             let (a, b) = if i < j { (i, j) } else { (j, i) };
-            gestalt::gestalt_edge(&chars[a], &chars[b], &sams[b], threshold).map(|r| (a, b, r))
+            gestalt::gestalt_edge(&chars[a], &chars[b], &sams[b], threshold).map(|r| (a, b, Some(r)))
         })
         .collect();
     if debug {
         eprintln!("    [difflib-fast] lsh: {} verified pairs in {:.2}s", pairs.len(), start.elapsed().as_secs_f64());
     }
+    let sams = LazySams::built(&chars, sams);
     assemble(n, pairs, &chars, &sams)
 }
 

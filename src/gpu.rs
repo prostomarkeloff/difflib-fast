@@ -1081,12 +1081,12 @@ impl CorpusGpu {
         //
         // Root (state 0) has no link; its `link_len` is set to 0. The kernel never reads `nd.x`
         // for state==0 (state==0 path either succeeds via root_next or sets matched=0 and breaks).
-        let total_nodes: usize = sams.iter().map(|s| s.nodes().len()).sum();
+        let node_tables: Vec<Vec<[u32; 4]>> = sams.iter().map(crate::gestalt::Sam::nodes).collect();
+        let total_nodes: usize = node_tables.iter().map(Vec::len).sum();
         let mut sam_nodes: Vec<[u32; 4]> = Vec::with_capacity(total_nodes);
         let mut sam_node_offsets: Vec<u32> = Vec::with_capacity(sams.len() + 1);
         sam_node_offsets.push(0);
-        for sam in sams {
-            let nodes = sam.nodes();
+        for nodes in &node_tables {
             for (state, &node) in nodes.iter().enumerate() {
                 let link = node[1] as usize;
                 let link_len = if state == 0 { 0 } else { nodes[link][0] };
