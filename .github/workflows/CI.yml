@@ -1,8 +1,7 @@
 # Build + test, then on a version tag (`vX.Y.Z`) attach wheels + sdist to a GitHub Release.
-# crates.io is published manually (`cargo publish`). No PyPI — install the Python package from a
-# release wheel or via `pip install git+https://github.com/prostomarkeloff/difflib-fast`.
-#
-# No secrets needed — the GitHub Release uses the built-in GITHUB_TOKEN.
+# crates.io is published manually (`cargo publish`), and so is PyPI: download the release's
+# wheels + sdist and `uv publish` them. Nothing here needs a secret — the GitHub Release uses the
+# built-in GITHUB_TOKEN.
 #
 # abi3 (pyo3 abi3-py39) → one wheel per platform/arch works on CPython 3.9+, so no per-Python matrix.
 name: CI
