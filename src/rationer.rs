@@ -603,7 +603,7 @@ fn ratio_many_via_prepared_cpu(
     use rayon::prelude::*;
     let n = pairs.len();
     // OPTIMIZATION C: sort pair indices by b (then a) so adjacent rayon-chunk work hits the
-    // same SAM → b's node + edges + epmeta + epos stay in L2 across calls. Without this each
+    // same SAM → b's automaton tables stay in L2 across calls. Without this each
     // worker thread bounces between SAMs in input order (random) and pays L2 eviction per pair.
     let mut perm: Vec<u32> = (0..n as u32).collect();
     perm.sort_unstable_by_key(|&i| {
@@ -672,7 +672,7 @@ where
         chars_pool.par_iter().map(|c| crate::gestalt::build_sam(c)).collect();
 
     // OPTIMIZATION C: sort indices by b (then a) so each rayon worker gets a chunk of consecutive
-    // pairs sharing the same SAM-b → b's node + edges + epmeta + epos stay in L2 across calls.
+    // pairs sharing the same SAM-b → b's automaton tables stay in L2 across calls.
     let n = pair_idx.len();
     let mut perm: Vec<u32> = (0..n as u32).collect();
     perm.sort_unstable_by_key(|&i| {
@@ -850,7 +850,7 @@ fn cluster_canonicals_multi_via_gpu(
     use rayon::prelude::*;
 
     use crate::gpu::CorpusGpu;
-    use crate::{assemble, char_counts, quick_ratio_counts, real_quick_ratio};
+    use crate::{assemble, char_counts, quick_ratio_counts, real_quick_ratio, LazySams};
 
     if groups.is_empty() {
         return Vec::new();
@@ -982,7 +982,7 @@ fn cluster_canonicals_multi_via_gpu(
     }
 
     // Per-group `pairs` arrays (for `assemble` later) — populate from GPU results.
-    let mut per_group_edges: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); groups.len()];
+    let mut per_group_edges: Vec<Vec<(usize, usize, Option<f64>)>> = vec![Vec::new(); groups.len()];
 
     if !pairs_for_gpu.is_empty() {
         // Chunk the GPU dispatch to keep the output buffer (fmatch + fstate) under ~1 GB. Each
@@ -1033,7 +1033,7 @@ fn cluster_canonicals_multi_via_gpu(
             per_group_edges[gi as usize].push((
                 af as usize - base,
                 bf as usize - base,
-                ratio,
+                Some(ratio),
             ));
         }
     }
@@ -1064,7 +1064,7 @@ fn cluster_canonicals_multi_via_gpu(
                     let sams_k: Vec<crate::gestalt::Sam> = (lo_k..lo_k + n_k)
                         .map(|i| unique_sams[flat_to_unique[i] as usize].clone())
                         .collect();
-                    out.push(assemble(n_k, edges, &chars_k, &sams_k));
+                    out.push(assemble(n_k, edges, &chars_k, &LazySams::built(&chars_k, sams_k)));
                 }
             }
             return out;
@@ -1086,7 +1086,7 @@ fn cluster_canonicals_multi_via_gpu(
             let sams_k: Vec<crate::gestalt::Sam> = (lo..hi)
                 .map(|i| unique_sams[flat_to_unique[i] as usize].clone())
                 .collect();
-            assemble(n, std::mem::take(&mut per_group_edges[gi].clone()), &chars_k, &sams_k)
+            assemble(n, per_group_edges[gi].clone(), &chars_k, &LazySams::built(&chars_k, sams_k))
         })
         .collect()
 }
@@ -1114,7 +1114,7 @@ fn cluster_canonicals_chars_via_gpu(
     use rayon::prelude::*;
 
     use crate::gpu::CorpusGpu;
-    use crate::{assemble, char_counts, quick_ratio_counts, real_quick_ratio};
+    use crate::{assemble, char_counts, quick_ratio_counts, real_quick_ratio, LazySams};
 
     let n = chars.len();
     if n < 2 {
@@ -1133,7 +1133,7 @@ fn cluster_canonicals_chars_via_gpu(
 
     // CPU-side filter: length blocking + quick_ratio. Produces candidate (i, j) pairs with i < j.
     // Length-sorted outer loop + break-on-length-bound is the same shape as the canonical
-    // qualifying_pairs path, so we don't visit any pair we'd skip there.
+    // candidate-pairs path, so we don't visit any pair we'd skip there.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&i| chars[i].len());
     let counts: Vec<Vec<(char, u32)>> = chars.par_iter().map(|c| char_counts(c)).collect();
@@ -1161,7 +1161,7 @@ fn cluster_canonicals_chars_via_gpu(
         .collect();
 
     if candidates.is_empty() {
-        return assemble(n, Vec::new(), chars, &sams);
+        return assemble(n, Vec::new(), chars, &LazySams::built(chars, sams));
     }
 
     // GPU pass: matching_stats kernel + CPU `gestalt_edge_with_ms` per pair. (Stage 4d/4f
@@ -1171,7 +1171,7 @@ fn cluster_canonicals_chars_via_gpu(
     let flat = gpu.matching_stats_batched_flat(&corpus, &pairs_for_gpu);
     let fstate_all = flat.fstate_all();
     let fmatch_all = flat.fmatch_all();
-    let edges: Vec<(usize, usize, f64)> = (0..pairs_for_gpu.len())
+    let edges: Vec<(usize, usize, Option<f64>)> = (0..pairs_for_gpu.len())
         .into_par_iter()
         .filter_map(|slot| {
             let orig = flat.pair_orig_idx[slot] as usize;
@@ -1189,11 +1189,11 @@ fn cluster_canonicals_chars_via_gpu(
                 threshold,
                 delta,
             )?;
-            Some((a_idx as usize, b_idx as usize, ratio))
+            Some((a_idx as usize, b_idx as usize, Some(ratio)))
         })
         .collect();
 
-    assemble(n, edges, chars, &sams)
+    assemble(n, edges, chars, &LazySams::built(chars, sams))
 }
 
 // SAFETY: All owned fields (Gpu, BoostGuard) are Send+Sync (Gpu wraps Metal handles documented

@@ -182,6 +182,50 @@ per-repo tables, and the C++ / Python harnesses are in [`benchmarks.md`](benchma
 ¹ transformers' model code has unusually long functions (per-pair RO is `O(L·log L)`), so raw
 throughput is lower — the same reason `difflib` struggles there.
 
+### Clustering, 0.4.0: 3.7× less CPU on the name-gated workload, every byte the same
+
+`cluster_canonicals` is what [find-dup-defs](https://github.com/prostomarkeloff/find-dup-defs)
+calls once per same-name group — thousands of calls per repository, most of them two or three
+long canonical bodies, a few of them hundreds. Replaying every call of one such run (2 892 calls,
+9 527 strings, 23 M characters, threshold 0.5) through the library alone, before and after:
+
+| | 0.3.5 | 0.4.0 |
+|---|---:|---:|
+| single thread | 9.78 s | **2.66 s** |
+| 12 threads (M3 Pro, 6 P + 6 E) | 1.30 s | **0.38 s** |
+
+In the tool itself that pass went from 1.47 s to 0.55 s on that run (1.16× on the whole run,
+whose other passes do not touch this crate). Ten output modes of that tool were diffed against
+the 0.3.5 build on two corpora, and nothing moved; the library's own gates (`fast_matches_reference`, `qualifies_matches_ratio_threshold`,
+the GPU parity test) pass unchanged. What changed, in the order it mattered:
+
+- **Only the automata that are scanned get built.** A pair scans one string against the other's
+  automaton, so a string that is never the automaton side of a surviving pair never needs one —
+  in a group of two that is one build, not two, and the build is the most expensive step per string.
+- **Only spanning edges are tested.** Single-linkage needs the connected components, not every
+  edge: candidates are visited most-similar-first in batches with a union-find between them, and a
+  pair already connected is not tested. A dense cluster of `k` strings costs about `k` edge tests
+  instead of `k²/2`, and its chained non-edges are never rejected the hard way.
+- **The cluster minimum runs under a shared cap.** Every intra pair is computed against the
+  cluster's running minimum: a single common substring proves a pair above it before the
+  recursion starts (often before the scan — a common prefix or suffix is checked first), the
+  pair that *is* the minimum is always computed exactly, and the result is the exact minimum.
+- **Narrow windows skip the automaton.** Half the recursion's windows have a `b` side of a
+  handful of characters; the chain walk climbs far there and mostly finds nothing, so those go
+  to a direct row-by-row comparison. Wider windows are taken largest-first, which closes both
+  early exits in fewer windows.
+- **The automaton got cheaper to build and to walk:** a per-thread builder with four inline
+  transitions per state, endpos ranges laid out by two length-order passes instead of a tree walk,
+  sorted copies only for the few states with large endpos sets instead of a merge-sort tree over
+  every position, and a 32-byte scan slot whose inline transition continues along `b` so a match
+  that keeps extending costs one load per character.
+
+Things that were measured and did not pay: a non-overlapping-interval bound on `fmatch` as an
+in-scan reject (never fires on code — dissimilar functions still share long substrings), a
+per-position window bound carried down the recursion, interleaving several scans to overlap
+their cache misses (the scan is instruction-bound, not latency-bound), and a 128-bit character
+set in the scan slot.
+
 **vs other exact-RO implementations** — single thread, same metric, across the five repos above:
 
 | competitor | difflib-fast speedup |

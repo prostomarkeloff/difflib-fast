@@ -58,6 +58,14 @@ code has unusually long functions, and per-pair RO is `O(L·log L)`.)
 
 ---
 
+### 1a. 0.4.0 — the many-small-groups shape
+
+The table above is one large group. The shape `find-dup-defs` actually issues is thousands of
+`cluster_canonicals` calls per repository, most of two or three long canonical bodies and a few of
+hundreds. Replaying every call of one such run (2 892 calls, 9 527 strings, 23 M characters,
+threshold 0.5) through the library alone: **9.78 s → 2.66 s single-threaded, 1.30 s → 0.38 s on
+12 threads**, output identical. The README's *Clustering, 0.4.0* section lists what changed.
+
 ## 1b. GPU (Metal) — heterogeneous `cluster_canonicals`
 
 Behind the `gpu` feature on Apple Silicon, `Rationer::cluster_canonicals` runs the suffix-automaton

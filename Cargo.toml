@@ -1,6 +1,6 @@
 [package]
 name = "difflib-fast"
-version = "0.3.5"
+version = "0.4.0"
 description = "Fast, byte-for-byte exact difflib Ratcliff–Obershelp (gestalt) similarity ratio + single-linkage clustering (suffix automaton), plus an exact all-pairs weighted-cosine similarity join (L2AP, CPU+GPU)."
 keywords = ["difflib", "similarity", "ratcliff-obershelp", "suffix-automaton", "fuzzy"]
 categories = ["algorithms", "text-processing"]

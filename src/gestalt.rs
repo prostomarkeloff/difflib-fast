@@ -12,7 +12,14 @@
 //!     memory, no hashing — and crucially no O(deg) scan at the high-degree root, which the
 //!     scan hammers when strings are dissimilar;
 //!   * the b-side automaton is **prebuilt once per string** (`build_sam`) and reused for
-//!     every pair, so the all-pairs cost is n builds + n² scans, not n² builds.
+//!     every pair, so the all-pairs cost is n builds + n² scans, not n² builds;
+//!   * the scan reads one 32-byte slot per state whose inline transition continues along `b`,
+//!     so a match that keeps extending costs one load per character (`Sam::fast`);
+//!   * the recursion's narrow windows (`b` side of a few characters) go to a direct row-by-row
+//!     comparison (`longest_direct`) instead of climbing the automaton for every position, and
+//!     the early-exit recursions take the largest window first so their bounds close sooner;
+//!   * the scan can stop the moment a single match proves the pair above a bound
+//!     (`matching_stats_bounded`), and a common prefix or suffix decides many pairs before it.
 //!   * **prefetch hints attempted on the per-iteration `node[state]` load** — the SAM walk is a
 //!     data-dependent pointer chase the hardware prefetcher cannot anticipate. A `prfm pldl1keep`
 //!     (`AArch64`) / `_mm_prefetch` (x86) experiment was MEASURED on M3 Pro and did NOT pay off
@@ -41,6 +48,7 @@ const ROOT_TBL: usize = 128;
 /// after the workload completes via `instrument::dump()`. Use `instrument::reset()` between
 /// successive workload runs in the same process so the numbers stay per-workload.
 #[cfg(feature = "instrument")]
+#[allow(clippy::all, clippy::pedantic)] // diagnostics only; never in a default build
 pub mod instrument {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,6 +72,27 @@ pub mod instrument {
     pub static FMATCH_NONZERO: AtomicU64 = AtomicU64::new(0);
     pub static FMATCH_SUM: AtomicU64 = AtomicU64::new(0); // sum of all non-zero fmatch values
 
+    /// Per log2(min(|aw|,|bw|)) bucket: longest_in calls, positions iterated, chain walks, chain steps, calls that found nothing.
+    pub static WIN_CALLS: [AtomicU64; 24] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 24] };
+    pub static WIN_POS: [AtomicU64; 24] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 24] };
+    pub static WIN_WALKS: [AtomicU64; 24] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 24] };
+    pub static WIN_STEPS: [AtomicU64; 24] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 24] };
+    pub static WIN_ZERO: [AtomicU64; 24] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 24] };
+    /// Chain steps + longest_in calls by pair category: 0 exact, 1 edge test, 2 capped.
+    pub static CAT_STEPS: [AtomicU64; 3] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 3] };
+    pub static CAT_CALLS: [AtomicU64; 3] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 3] };
+    pub static CAT_PAIRS: [AtomicU64; 3] = { const ZERO: AtomicU64 = AtomicU64::new(0); [ZERO; 3] };
+    thread_local! {
+        pub static TL_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        pub static TL_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    pub fn pair_done(cat: usize) {
+        let s = TL_STEPS.with(|c| c.replace(0));
+        let n = TL_CALLS.with(|c| c.replace(0));
+        CAT_STEPS[cat].fetch_add(s, Ordering::Relaxed);
+        CAT_CALLS[cat].fetch_add(n, Ordering::Relaxed);
+        CAT_PAIRS[cat].fetch_add(1, Ordering::Relaxed);
+    }
     pub static CHAIN_DEPTHS: [AtomicU64; HIST_BUCKETS] = {
         // const init via repeated AtomicU64::new(0) — array initializer.
         const ZERO: AtomicU64 = AtomicU64::new(0);
@@ -215,6 +244,15 @@ pub mod instrument {
         }
         s.push('\n');
 
+        for (k, name) in ["exact", "edge", "capped"].iter().enumerate() {
+            s.push_str(&format!("category {name:>6}: pairs {:>9} longest_in {:>10} steps {:>12}\n", CAT_PAIRS[k].load(Ordering::Relaxed), CAT_CALLS[k].load(Ordering::Relaxed), CAT_STEPS[k].load(Ordering::Relaxed)));
+        }
+        s.push_str("windows by log2(min side): calls / positions / walks / steps / found-nothing\n");
+        for k in 0..24 {
+            let c = WIN_CALLS[k].load(Ordering::Relaxed);
+            if c == 0 { continue; }
+            s.push_str(&format!("  2^{:<2} {:>10} {:>12} {:>12} {:>12} {:>10}\n", k, c, WIN_POS[k].load(Ordering::Relaxed), WIN_WALKS[k].load(Ordering::Relaxed), WIN_STEPS[k].load(Ordering::Relaxed), WIN_ZERO[k].load(Ordering::Relaxed)));
+        }
         let mut rec_total = 0u64;
         let rec: Vec<u64> = RECURSION_DEPTHS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
         for &v in &rec {
@@ -237,11 +275,13 @@ pub mod instrument {
 /// Helper that the instrument hooks call when the feature is enabled; no-op otherwise.
 #[cfg(feature = "instrument")]
 #[inline(always)]
+#[allow(clippy::inline_always)]
 fn instr_inc(c: &std::sync::atomic::AtomicU64, by: u64) {
     c.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
 }
 #[cfg(feature = "instrument")]
 #[inline(always)]
+#[allow(clippy::inline_always)]
 fn instr_hist(buckets: &[std::sync::atomic::AtomicU64; instrument::HIST_BUCKETS], depth: usize) {
     buckets[depth.min(instrument::HIST_BUCKETS - 1)]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -251,104 +291,85 @@ fn instr_hist(buckets: &[std::sync::atomic::AtomicU64; instrument::HIST_BUCKETS]
 /// Suffix automaton with CSR (sorted-per-state) transitions — built once, queried by scans.
 ///
 /// For the range-restricted recursion (fix b), each state also carries its **endpos** as a
-/// contiguous slice `[dfs_in, dfs_in+dfs_cnt)` of `epos` (the end-positions in b, laid out by
-/// a DFS of the suffix-link tree so a subtree is contiguous). A merge-sort tree over `epos`
-/// answers "is there an end-position in [lo,hi] within this state's subtree, and the min/max
-/// such" — so the whole RO recursion runs on this one prebuilt SAM, with **no sub-builds**.
+/// contiguous slice `[dfs_in, dfs_in+dfs_cnt)` of `epos` (the end-positions in b, laid out so
+/// that every subtree of the suffix-link tree is contiguous). Small sets are scanned linearly;
+/// the few states whose set is larger than [`LINEAR_MAX`] carry a sorted copy in `big_sorted`,
+/// and "is there an end-position in [lo,hi] within this state's subtree, and the min/max such"
+/// is one binary search there — so the whole RO recursion runs on this one prebuilt SAM, with
+/// **no sub-builds**.
 #[derive(Clone)]
 pub struct Sam {
-    // Per-state hot fields packed into one cache-line-friendly struct `[len, link, edge_lo, edge_hi]`
-    // so a state visit in the scan/recursion loads len + link + transition-range with a SINGLE cache
-    // miss (these were 5 separate arrays — under multi-thread DRAM-bandwidth pressure, fewer distinct
-    // lines per visit is the dominant win). `link` is u32: the root's link (-1) is stored as 0 and
-    // never read, since both the scan and `longest_in` stop at state 0 before following its link.
-    node: Vec<[u32; 4]>,
     // Transitions packed as `(char as u64) << 32 | to`, sorted by char within each state's range
     // [edge_lo, edge_hi). Co-locating char+target means the binary-search key and the taken edge's
     // target live on the same cache line (was two parallel arrays `csr_char`/`csr_to`).
     edges: Vec<u64>,
-    firstpos: Vec<u32>,  // per state: *smallest* end-position (build-time; folded into epmeta)
-    lastpos: Vec<u32>,   // per state: *largest* end-position (build-time; folded into epmeta)
     // Direct lookup for the root's ASCII transitions (`root_next[c] = state`, or -1). The root is
     // the high-degree state hit after every match reset; this makes its transition O(1) instead
     // of a binary search. Non-ASCII root chars (rare) fall back to the edge search, so it's general.
     root_next: Vec<i32>,
-    dfs_in: Vec<u32>,    // per state: start index into the endpos array of its endpos range
-    dfs_cnt: Vec<u32>,   // per state: number of end-positions in its subtree
-    // merge-sort tree over the DFS-ordered end-positions, flattened CSR-style: node `i`'s sorted
-    // range is seg_data[seg_off[i]..seg_off[i+1]] (node 1 = root). A state's endpos is the leaf
-    // range [dfs_in, dfs_in+dfs_cnt); the tree answers range predecessor/successor adaptively in
-    // O(log²·slice) — and `firstpos`/`lastpos` give an O(1) fast path that skips it when the query
-    // bound doesn't split the state's endpos span (the common case for wide windows).
-    seg_data: Vec<u32>,
-    seg_off: Vec<u32>,
-    seg_n: usize,        // number of leaves (power of two) in the merge-sort tree
-    // Precomputed `len(link[s])` per state — used by `longest_in`'s chain walk's `band_min` check.
-    // Without this, every chain step does TWO node loads: `node[cur]` for (len, link, ...), then
-    // `node[node[cur].link]` for its `len`. Storing the link's length in a parallel array lets the
-    // hot loop fold both into one cache line. Saves ~1 memory access per chain step on M3 — chain
-    // walks are pointer-chase-bound, so this is a measurable win on `longest_in` (the 70%-of-CPU
-    // function on prepared ratio_many).
-    link_len: Vec<u32>,
-    // DFS-ordered end-positions (each state's endpos = contiguous slice [dfs_in, dfs_in+dfs_cnt)).
-    // For small endpos sets a cache-friendly linear scan of this beats the scattered tree descent.
+    // The scan's per-state slot, one 32-byte line:
+    //   [0] c0  [1] t0   first inline transition — for a per-position state the one that continues
+    //                     along `b`, so a match that keeps extending costs one load per character
+    //   [2] c1  [3] t1   second inline transition (the state's next one in char order)
+    //   [4] edge_lo  [5] edge_hi   the state's range in `edges`, for a state with more than two
+    //   [6] link  [7] link_len     the fallback: suffix link and `len(link)`, the matched length after it
+    // Nearly every state has one or two transitions, so a miss on the inline pair means a
+    // fallback, not a search; `c0`/`c1` are `u32::MAX` (no code point) when absent. (A 128-bit
+    // character set in place of the second transition and the range was measured slower.)
+    fast: Vec<ScanSlot>,
+    // Per position of `b`, the state reached by reading `b[..=pos]` from the root (the state
+    // created for that position). A scan of a string sharing a prefix with `b` starts there.
+    pos_state: Vec<u32>,
+    // End-positions laid out by subtree (each state's endpos = contiguous slice
+    // [dfs_in, dfs_in+dfs_cnt)). For small endpos sets a cache-friendly linear scan of this beats
+    // any tree descent.
     epos: Vec<u32>,
-    // Query-hot per-state fields packed into one cache line `[firstpos, lastpos, dfs_in, dfs_cnt]`
-    // so `max_le`/`min_in` load all four with a single cache miss (they were 4 separate arrays).
-    epmeta: Vec<[u32; 4]>,
-    // Optimization B (Phase 4): chain-walk hot slot. Layout:
-    //   [0]   = len (same as node[s][0])
-    //   [1]   = link (same as node[s][1])
-    //   [2]   = link_len[s]
-    //   [3]   = padding
-    //   [4..8] = epmeta[s] = [firstpos, lastpos, dfs_in, dfs_cnt]
-    //
-    // 32 bytes / state — one cache-line-aligned load supplies everything `longest_in`'s chain
-    // walk + `max_le`/`min_in`'s fast path need for one state. Replaces three separate scattered
-    // accesses (`node[cur]`, `link_len[cur]`, `epmeta[cur]`) on the chain-walk hot path; PMU said
-    // L1D miss rate was 0.51 % and accounted for 18 % of cycles, distributed across these three
-    // per-state arrays. Co-locating folds 3 cache-line misses per chain step into 1.
-    //
-    // Memory cost: +32 bytes / state ≈ +1.6 MB on a 50 k-state SAM. Total `Sam` size grows ~20 %.
-    // Bench `bench_new delta-sweep` validates a wall-time reduction on the exact path.
+    // Chain-walk hot slot, 32 bytes per state:
+    //   [0] len   [1] link   [2] link_len   [3] sorted_off (u32::MAX if dfs_cnt <= LINEAR_MAX)
+    //   [4] firstpos   [5] lastpos   [6] dfs_in   [7] dfs_cnt
+    // One cache-line-aligned load supplies everything `longest_in`'s chain walk + `max_le`/`min_in`
+    // need for one state. Replaces three separate scattered accesses; PMU said L1D miss rate was
+    // 0.51 % and accounted for 18 % of cycles, distributed across those per-state arrays.
     chain_slot: Vec<[u32; 8]>,
+    // Sorted end-positions of the states with more than `LINEAR_MAX` of them (short, frequent
+    // substrings near the root), concatenated; a state's copy starts at `chain_slot[s][3]`.
+    // Replaces a merge-sort tree over all positions: those queries were under 1 % of the endpos
+    // queries on real code, and the tree cost one allocation per leaf to build.
+    big_sorted: Vec<u32>,
 }
 
-/// Below this endpos-set size, `max_le`/`min_in` linear-scan the contiguous DFS-ordered endpos
-/// (cache-friendly) instead of the merge-sort tree (scattered) — most queried sets are this small.
+/// One state's scan slot (see `Sam::fast`), aligned so a state never straddles two cache lines.
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct ScanSlot([u32; 8]);
+
+/// Below this endpos-set size, `max_le`/`min_in` linear-scan the state's contiguous endpos slice
+/// (cache-friendly) instead of binary-searching a sorted copy — most queried sets are this small.
 const LINEAR_MAX: usize = 256;
 
 impl Sam {
     fn empty() -> Self {
         Sam {
-            node: Vec::new(),
             edges: Vec::new(),
-            firstpos: Vec::new(),
-            lastpos: Vec::new(),
             root_next: Vec::new(),
-            dfs_in: Vec::new(),
-            dfs_cnt: Vec::new(),
-            seg_data: Vec::new(),
-            seg_off: Vec::new(),
-            seg_n: 0,
+            fast: Vec::new(),
+            pos_state: Vec::new(),
             epos: Vec::new(),
-            epmeta: Vec::new(),
-            link_len: Vec::new(),
             chain_slot: Vec::new(),
+            big_sorted: Vec::new(),
         }
     }
 
-    /// Node `i`'s sorted endpos range in the flattened merge-sort tree.
-    fn seg_node(&self, i: usize) -> &[u32] {
-        &self.seg_data[self.seg_off[i] as usize..self.seg_off[i + 1] as usize]
-    }
-
-    /// Read-only view of the packed `[len, link, edge_lo, edge_hi]` per state — needed by the
-    /// GPU port (`gpu::matching_stats_gpu`) to serialize the SAM into a Metal buffer. The kernel
-    /// reads this slice via index calculations, so we expose it raw (one `[u32; 4]` per state).
+    /// The packed `[len, link, edge_lo, edge_hi]` per state — what the GPU port
+    /// (`gpu::matching_stats_gpu`) serializes into a Metal buffer. `link` is the root's link (-1)
+    /// stored as 0, never read. Assembled from the CPU tables on request.
     #[must_use]
-    pub fn nodes(&self) -> &[[u32; 4]] {
-        &self.node
+    pub fn nodes(&self) -> Vec<[u32; 4]> {
+        self.chain_slot
+            .iter()
+            .zip(&self.fast)
+            .map(|(cs, f)| [cs[0], cs[1], f.0[4], f.0[5]])
+            .collect()
     }
 
     /// Read-only view of the packed edge slice: `(char << 32) | target_state`, sorted by char
@@ -367,40 +388,34 @@ impl Sam {
         &self.root_next
     }
 
-    /// `state`'s endpos slice as the merge-sort-tree leaf range [l, r), from packed `epmeta`.
-    fn endpos_range_m(m: &[u32; 4], seg_n: usize) -> (usize, usize) {
-        let s = m[2] as usize; // dfs_in
-        (s + seg_n, s + m[3] as usize + seg_n) // dfs_cnt
-    }
-
-    /// Largest end-position `<= x` among `state`'s endpos, with pre-loaded metadata. Used by
-    /// `longest_in`'s chain walk where `m` was already pulled from `chain_slot[cur]` (Optimization
-    /// B) — saves an `epmeta[state]` load that would hit a separate cache line.
-    fn max_le_with_meta(&self, m: &[u32; 4], x: u32) -> Option<u32> {
+    /// Largest end-position `<= x` among the state's endpos, from its pre-loaded chain slot
+    /// `cs` (see `chain_slot`). Used by `longest_in`'s chain walk where `cs` was already pulled
+    /// from `chain_slot[cur]` — no second per-state load.
+    fn max_le_slot(&self, cs: &[u32; 8], x: u32) -> Option<u32> {
         #[cfg(feature = "instrument")]
         instr_inc(&instrument::MAX_LE_CALLS, 1);
         // O(1) fast path: x doesn't split the state's [firstpos, lastpos] span.
-        if m[1] <= x {
+        if cs[5] <= x {
             #[cfg(feature = "instrument")]
             instr_inc(&instrument::MAX_LE_FAST_PATH, 1);
-            return Some(m[1]);
+            return Some(cs[5]);
         }
-        if m[0] > x {
+        if cs[4] > x {
             #[cfg(feature = "instrument")]
             instr_inc(&instrument::MAX_LE_FAST_PATH, 1);
             return None;
         }
-        let cnt = m[3] as usize;
+        let cnt = cs[7] as usize;
         if cnt <= LINEAR_MAX {
             #[cfg(feature = "instrument")]
             {
                 instr_inc(&instrument::MAX_LE_LINEAR, 1);
                 instr_inc(&instrument::MAX_LE_LINEAR_LEN_SUM, cnt as u64);
             }
-            let lo = m[2] as usize;
+            let lo = cs[6] as usize;
             let mut best = 0u32;
-            // SAFETY: `m` comes from a valid SAM state's epmeta or chain_slot, so the slice
-            // [m[2], m[2]+m[3]) is within `self.epos` (built that way at SAM construction).
+            // SAFETY: `cs` is a valid SAM state's chain slot, so the slice [cs[6], cs[6]+cs[7]) is
+            // within `self.epos` (built that way at SAM construction).
             #[allow(clippy::undocumented_unsafe_blocks)]
             for &v in unsafe { self.epos.get_unchecked(lo..lo + cnt) } {
                 best = best.max(if v <= x { v } else { 0 });
@@ -409,47 +424,34 @@ impl Sam {
         }
         #[cfg(feature = "instrument")]
         instr_inc(&instrument::MAX_LE_SEGTREE, 1);
-        let (mut l, mut r) = Self::endpos_range_m(m, self.seg_n);
-        let mut best: Option<u32> = None;
-        while l < r {
-            if l & 1 == 1 {
-                best = best.max(node_max_le(self.seg_node(l), x));
-                l += 1;
-            }
-            if r & 1 == 1 {
-                r -= 1;
-                best = best.max(node_max_le(self.seg_node(r), x));
-            }
-            l >>= 1;
-            r >>= 1;
-        }
-        best
+        let so = cs[3] as usize;
+        node_max_le(&self.big_sorted[so..so + cnt], x)
     }
 
-    /// Smallest end-position in `[lo, hi]` with pre-loaded metadata. See `max_le_with_meta`.
-    fn min_in_with_meta(&self, m: &[u32; 4], lo: u32, hi: u32) -> Option<u32> {
+    /// Smallest end-position in `[lo, hi]`, from the pre-loaded chain slot. See `max_le_slot`.
+    fn min_in_slot(&self, cs: &[u32; 8], lo: u32, hi: u32) -> Option<u32> {
         #[cfg(feature = "instrument")]
         instr_inc(&instrument::MIN_IN_CALLS, 1);
-        if m[0] >= lo {
+        if cs[4] >= lo {
             #[cfg(feature = "instrument")]
             instr_inc(&instrument::MIN_IN_FAST_PATH, 1);
-            return (m[0] <= hi).then_some(m[0]);
+            return (cs[4] <= hi).then_some(cs[4]);
         }
-        if m[1] < lo {
+        if cs[5] < lo {
             #[cfg(feature = "instrument")]
             instr_inc(&instrument::MIN_IN_FAST_PATH, 1);
             return None;
         }
-        let cnt = m[3] as usize;
+        let cnt = cs[7] as usize;
         if cnt <= LINEAR_MAX {
             #[cfg(feature = "instrument")]
             {
                 instr_inc(&instrument::MIN_IN_LINEAR, 1);
                 instr_inc(&instrument::MIN_IN_LINEAR_LEN_SUM, cnt as u64);
             }
-            let off = m[2] as usize;
+            let off = cs[6] as usize;
             let mut best = u32::MAX;
-            // SAFETY: `m` is from a valid SAM state; endpos slice within bounds (same as max_le).
+            // SAFETY: `cs` is from a valid SAM state; endpos slice within bounds (same as max_le).
             #[allow(clippy::undocumented_unsafe_blocks)]
             for &v in unsafe { self.epos.get_unchecked(off..off + cnt) } {
                 best = best.min(if v >= lo && v <= hi { v } else { u32::MAX });
@@ -458,23 +460,9 @@ impl Sam {
         }
         #[cfg(feature = "instrument")]
         instr_inc(&instrument::MIN_IN_SEGTREE, 1);
-        let (mut l, mut r) = Self::endpos_range_m(m, self.seg_n);
-        let mut best: Option<u32> = None;
-        while l < r {
-            if l & 1 == 1 {
-                best = merge_min(best, node_min_in(self.seg_node(l), lo, hi));
-                l += 1;
-            }
-            if r & 1 == 1 {
-                r -= 1;
-                best = merge_min(best, node_min_in(self.seg_node(r), lo, hi));
-            }
-            l >>= 1;
-            r >>= 1;
-        }
-        best
+        let so = cs[3] as usize;
+        node_min_in(&self.big_sorted[so..so + cnt], lo, hi)
     }
-
 }
 
 /// Largest value `<= x` in a sorted slice, or None.
@@ -489,106 +477,175 @@ fn node_min_in(sorted: &[u32], lo: u32, hi: u32) -> Option<u32> {
     sorted.get(k).copied().filter(|&v| v <= hi)
 }
 
-fn merge_min(a: Option<u32>, b: Option<u32>) -> Option<u32> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.min(y)),
-        (x, None) => x,
-        (None, y) => y,
-    }
-}
+/// Transitions a builder state keeps inline; the rest overflow into the list arena. Nearly every
+/// state of a code string's automaton has one or two, so `find` almost never touches the arena.
+const INLINE: usize = 4;
 
-/// Transient builder (Ukkonen online SAM with a linked-list transition arena).
+/// "No code point" marker for an empty inline transition slot (no `char` is `u32::MAX`).
+const NONE: u32 = u32::MAX;
+
+/// Transient builder (Ukkonen online SAM). One per thread, reused across builds: every arena and
+/// scratch vector keeps its capacity, so building a SAM allocates only the vectors the finished
+/// `Sam` owns.
 struct Builder {
-    edge_char: Vec<char>,
+    // per state: up to `INLINE` transitions as `[c0, t0, c1, t1, ...]`, `NONE` when empty
+    inl: Vec<[u32; 2 * INLINE]>,
+    deg: Vec<u32>, // per state: number of transitions, inline and overflowed
+    // overflow arena (a state's transitions beyond `INLINE`), linked per state from `head`
+    edge_char: Vec<u32>,
     edge_to: Vec<u32>,
     edge_next: Vec<i32>,
     head: Vec<i32>,
+    // The root's ASCII transitions as a direct table (`-1` = none): the root has by far the most
+    // transitions (one per distinct character) and every extension whose character is new to
+    // the current suffixes walks up to it.
+    root_tbl: Vec<i32>,
     link: Vec<i32>,
     len: Vec<u32>,
     firstpos: Vec<u32>,
     primary: Vec<bool>, // true for the per-position state (its firstpos is a real end-position)
     last: u32,
+    // finalize scratch
+    off: Vec<u32>,
+    child_head: Vec<u32>,
+    child_arr: Vec<u32>,
+    lastpos: Vec<u32>,
+}
+
+thread_local! {
+    /// The per-thread SAM builder — arenas and scratch retained across `build_sam` calls.
+    static BUILDER: std::cell::RefCell<Builder> = std::cell::RefCell::new(Builder::empty());
 }
 
 impl Builder {
     fn empty() -> Self {
         Builder {
+            inl: Vec::new(),
+            deg: Vec::new(),
             edge_char: Vec::new(),
             edge_to: Vec::new(),
             edge_next: Vec::new(),
             head: Vec::new(),
+            root_tbl: Vec::new(),
             link: Vec::new(),
             len: Vec::new(),
             firstpos: Vec::new(),
             primary: Vec::new(),
             last: 0,
+            off: Vec::new(),
+            child_head: Vec::new(),
+            child_arr: Vec::new(),
+            lastpos: Vec::new(),
         }
-    }
-
-    fn new(cap: usize) -> Self {
-        let mut b = Builder::empty();
-        b.reset(cap);
-        b
     }
 
     /// Clear the arenas (keeping capacity) and re-seed the root — for buffer reuse.
     fn reset(&mut self, cap: usize) {
+        self.inl.clear();
+        self.deg.clear();
         self.edge_char.clear();
         self.edge_to.clear();
         self.edge_next.clear();
         self.head.clear();
+        self.root_tbl.clear();
+        self.root_tbl.resize(ROOT_TBL, -1);
         self.link.clear();
         self.len.clear();
         self.firstpos.clear();
         self.primary.clear();
-        self.edge_char.reserve(3 * cap);
-        self.edge_to.reserve(3 * cap);
-        self.edge_next.reserve(3 * cap);
-        self.primary.push(false); // root state 0 is not a per-position state
-        self.head.push(-1);
-        self.link.push(-1);
-        self.len.push(0);
-        self.firstpos.push(0);
+        self.inl.reserve(2 * cap + 1);
+        self.deg.reserve(2 * cap + 1);
+        self.head.reserve(2 * cap + 1);
+        self.link.reserve(2 * cap + 1);
+        self.len.reserve(2 * cap + 1);
+        self.firstpos.reserve(2 * cap + 1);
+        self.primary.reserve(2 * cap + 1);
+        self.new_state(0, -1, 0, false); // root state 0 is not a per-position state
         self.last = 0;
     }
 
     #[allow(clippy::cast_sign_loss)]
-    fn find(&self, state: u32, c: char) -> Option<u32> {
-        let mut e = self.head[state as usize];
-        while e != -1 {
-            let idx = e as usize;
-            if self.edge_char[idx] == c {
-                return Some(self.edge_to[idx]);
+    fn find(&self, state: u32, key: u32) -> Option<u32> {
+        if state == 0 && (key as usize) < ROOT_TBL {
+            let t = self.root_tbl[key as usize];
+            return (t >= 0).then_some(t as u32);
+        }
+        let e = &self.inl[state as usize];
+        // empty slots hold `NONE`, which no key equals
+        if e[0] == key {
+            return Some(e[1]);
+        }
+        if e[2] == key {
+            return Some(e[3]);
+        }
+        if e[4] == key {
+            return Some(e[5]);
+        }
+        if e[6] == key {
+            return Some(e[7]);
+        }
+        if self.deg[state as usize] as usize > INLINE {
+            let mut x = self.head[state as usize];
+            while x != -1 {
+                let idx = x as usize;
+                if self.edge_char[idx] == key {
+                    return Some(self.edge_to[idx]);
+                }
+                x = self.edge_next[idx];
             }
-            e = self.edge_next[idx];
         }
         None
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn add_edge(&mut self, state: u32, c: char, to: u32) {
-        self.edge_char.push(c);
-        self.edge_to.push(to);
-        self.edge_next.push(self.head[state as usize]);
-        self.head[state as usize] = (self.edge_char.len() - 1) as i32;
+    fn add_edge(&mut self, state: u32, key: u32, to: u32) {
+        let s = state as usize;
+        let d = self.deg[s] as usize;
+        if d < INLINE {
+            self.inl[s][2 * d] = key;
+            self.inl[s][2 * d + 1] = to;
+        } else {
+            self.edge_char.push(key);
+            self.edge_to.push(to);
+            self.edge_next.push(self.head[s]);
+            self.head[s] = (self.edge_char.len() - 1) as i32;
+        }
+        self.deg[s] = (d + 1) as u32;
+        if state == 0 && (key as usize) < ROOT_TBL {
+            self.root_tbl[key as usize] = to as i32;
+        }
     }
 
-    #[allow(clippy::cast_sign_loss)]
-    fn set_edge(&mut self, state: u32, c: char, to: u32) {
-        let mut e = self.head[state as usize];
-        while e != -1 {
-            let idx = e as usize;
-            if self.edge_char[idx] == c {
+    /// Redirect the existing transition `state --key-->` to `to` (the clone step).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    fn set_edge(&mut self, state: u32, key: u32, to: u32) {
+        let s = state as usize;
+        if state == 0 && (key as usize) < ROOT_TBL {
+            self.root_tbl[key as usize] = to as i32;
+        }
+        let e = &mut self.inl[s];
+        for k in 0..INLINE {
+            if e[2 * k] == key {
+                e[2 * k + 1] = to;
+                return;
+            }
+        }
+        let mut x = self.head[s];
+        while x != -1 {
+            let idx = x as usize;
+            if self.edge_char[idx] == key {
                 self.edge_to[idx] = to;
                 return;
             }
-            e = self.edge_next[idx];
+            x = self.edge_next[idx];
         }
-        self.add_edge(state, c, to);
+        self.add_edge(state, key, to);
     }
 
     #[allow(clippy::cast_possible_truncation)]
     fn new_state(&mut self, len: u32, link: i32, firstpos: u32, primary: bool) -> u32 {
+        self.inl.push([NONE; 2 * INLINE]);
+        self.deg.push(0);
         self.head.push(-1);
         self.len.push(len);
         self.link.push(link);
@@ -599,28 +656,35 @@ impl Builder {
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     fn extend(&mut self, c: char, pos: usize) {
+        let key = c as u32;
         let cur = self.new_state(self.len[self.last as usize] + 1, -1, pos as u32, true);
         let mut p = self.last as i32;
-        while p != -1 && self.find(p as u32, c).is_none() {
-            self.add_edge(p as u32, c, cur);
+        while p != -1 && self.find(p as u32, key).is_none() {
+            self.add_edge(p as u32, key, cur);
             p = self.link[p as usize];
         }
         if p == -1 {
             self.link[cur as usize] = 0;
         } else {
-            let q = self.find(p as u32, c).unwrap();
+            let q = self.find(p as u32, key).unwrap();
             if self.len[p as usize] + 1 == self.len[q as usize] {
                 self.link[cur as usize] = q as i32;
             } else {
                 let clone = self.new_state(self.len[p as usize] + 1, self.link[q as usize], self.firstpos[q as usize], false);
-                let mut e = self.head[q as usize];
-                while e != -1 {
-                    let idx = e as usize;
-                    self.add_edge(clone, self.edge_char[idx], self.edge_to[idx]);
-                    e = self.edge_next[idx];
+                // the clone starts with q's transitions
+                let qi = q as usize;
+                let inline = self.inl[qi];
+                for k in 0..(self.deg[qi] as usize).min(INLINE) {
+                    self.add_edge(clone, inline[2 * k], inline[2 * k + 1]);
                 }
-                while p != -1 && self.find(p as u32, c) == Some(q) {
-                    self.set_edge(p as u32, c, clone);
+                let mut x = self.head[qi];
+                while x != -1 {
+                    let idx = x as usize;
+                    self.add_edge(clone, self.edge_char[idx], self.edge_to[idx]);
+                    x = self.edge_next[idx];
+                }
+                while p != -1 && self.find(p as u32, key) == Some(q) {
+                    self.set_edge(p as u32, key, clone);
                     p = self.link[p as usize];
                 }
                 self.link[q as usize] = clone as i32;
@@ -630,202 +694,258 @@ impl Builder {
         self.last = cur;
     }
 
-    /// Convert the linked-list transitions into the packed `node`/`edges` layout (per-state edges
-    /// sorted by char, co-located char+target), reusing `out`'s allocations (no per-build malloc churn).
+    /// Convert the builder's transitions into the packed `edges` layout (per-state edges sorted
+    /// by char, co-located char+target) and derive every query table, into a fresh `Sam`. `b` is
+    /// the string the automaton was built from — the per-position states' inline transition is
+    /// the one that continues along it.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::needless_range_loop)]
-    fn finalize_into(&self, out: &mut Sam) {
+    fn finalize(&mut self, b: &[char]) -> Sam {
+        let mut out = Sam::empty();
         let nstates = self.head.len();
-        let nedges = self.edge_char.len();
-        out.firstpos.clear();
-        out.firstpos.extend_from_slice(&self.firstpos);
-        // per-state edge counts → exclusive prefix-sum offsets (local; folded into `node` below)
-        let mut off = vec![0u32; nstates + 1];
+        // per-state edge counts → exclusive prefix-sum offsets
+        let off = &mut self.off;
+        off.clear();
+        off.resize(nstates + 1, 0);
         for state in 0..nstates {
-            let mut e = self.head[state];
-            while e != -1 {
-                off[state + 1] += 1;
-                e = self.edge_next[e as usize];
-            }
+            off[state + 1] = off[state] + self.deg[state];
         }
-        for state in 0..nstates {
-            off[state + 1] += off[state];
-        }
+        let nedges = off[nstates] as usize;
         // edges: (char << 32 | to), sorted by char within each state's [off[s], off[s+1]) range.
         // sorting the packed u64 sorts by char (high bits) since a state's chars are distinct.
-        out.edges.clear();
+        // Nearly every state has one or two transitions: packed in place and insertion-sorted.
         out.edges.resize(nedges, 0);
-        let mut scratch: Vec<u64> = Vec::new(); // reused across states
+        self.pack_edges(&mut out, nstates);
+        self.tables(&mut out, nstates, b);
+        self.build_endpos(&mut out, nstates, b.len());
+        out
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::needless_range_loop)]
+    fn pack_edges(&mut self, out: &mut Sam, nstates: usize) {
+        let off = self.off.as_slice();
+        let (inl, deg, head, edge_char, edge_to, edge_next) = (
+            self.inl.as_slice(),
+            self.deg.as_slice(),
+            self.head.as_slice(),
+            self.edge_char.as_slice(),
+            self.edge_to.as_slice(),
+            self.edge_next.as_slice(),
+        );
+        let edges = out.edges.as_mut_slice();
         for state in 0..nstates {
-            scratch.clear();
-            let mut e = self.head[state];
-            while e != -1 {
-                let idx = e as usize;
-                scratch.push((u64::from(self.edge_char[idx] as u32) << 32) | u64::from(self.edge_to[idx]));
-                e = self.edge_next[idx];
-            }
-            scratch.sort_unstable();
             let base = off[state] as usize;
-            for (k, &packed) in scratch.iter().enumerate() {
-                out.edges[base + k] = packed;
+            let mut k = base;
+            let mut place = |packed: u64, k: &mut usize| {
+                // insertion into the sorted prefix [base, *k)
+                let mut p = *k;
+                while p > base && edges[p - 1] > packed {
+                    edges[p] = edges[p - 1];
+                    p -= 1;
+                }
+                edges[p] = packed;
+                *k += 1;
+            };
+            let e = &inl[state];
+            for slot in 0..(deg[state] as usize).min(INLINE) {
+                place((u64::from(e[2 * slot]) << 32) | u64::from(e[2 * slot + 1]), &mut k);
+            }
+            let mut x = head[state];
+            while x != -1 {
+                let idx = x as usize;
+                place((u64::from(edge_char[idx]) << 32) | u64::from(edge_to[idx]), &mut k);
+                x = edge_next[idx];
             }
         }
-        // per-state packed node [len, link(clamped: root -1 → 0, never read), edge_lo, edge_hi]
-        out.node.clear();
-        out.node.reserve(nstates);
-        out.link_len.clear();
-        out.link_len.reserve(nstates);
-        for s in 0..nstates {
-            let link_idx_signed = self.link[s];
-            let link = if link_idx_signed < 0 { 0 } else { link_idx_signed as u32 };
-            out.node.push([self.len[s], link, off[s], off[s + 1]]);
-            // Precompute len(link[s]) — saves the second node-load in `longest_in`'s chain walk.
-            // Root (link = -1) is never read here because the chain walk breaks before entering it.
-            let llen = if link_idx_signed < 0 { 0 } else { self.len[link_idx_signed as usize] };
-            out.link_len.push(llen);
-        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::needless_range_loop)]
+    fn tables(&mut self, out: &mut Sam, nstates: usize, b: &[char]) {
+        let off = self.off.as_slice();
+        let edges = out.edges.as_slice();
+        let (primary, firstpos, link_of, len_of) =
+            (self.primary.as_slice(), self.firstpos.as_slice(), self.link.as_slice(), self.len.as_slice());
         // root direct transition table (ASCII): fill from the root's edges
-        out.root_next.clear();
         out.root_next.resize(ROOT_TBL, -1);
-        for k in off[0] as usize..off[1] as usize {
-            let e = out.edges[k];
+        for &e in &edges[off[0] as usize..off[1] as usize] {
             let ci = (e >> 32) as usize;
             if ci < ROOT_TBL {
                 out.root_next[ci] = i32::try_from((e & 0xFFFF_FFFF) as u32).expect("state fits i32");
             }
         }
-        self.build_endpos(out, nstates);
+        // the scan slot: two inline transitions, the edge range, the suffix link and its length
+        out.fast.reserve(nstates);
+        for s in 0..nstates {
+            let (lo, hi) = (off[s] as usize, off[s + 1] as usize);
+            let es = &edges[lo..hi];
+            let split = |e: u64| ((e >> 32) as u32, (e & 0xFFFF_FFFF) as u32);
+            // e0: the continuation along `b` for a per-position state, else the first edge
+            let mut e0 = es.first().map_or((NONE, 0), |&e| split(e));
+            if primary[s] {
+                let next = firstpos[s] as usize + 1;
+                if next < b.len() {
+                    let t = csr_lookup(edges, lo, hi, b[next]);
+                    if t >= 0 {
+                        e0 = (b[next] as u32, t as u32);
+                    }
+                }
+            }
+            // e1: the first edge in char order that is not e0
+            let e1 = es.iter().map(|&e| split(e)).find(|&(c, _)| c != e0.0).unwrap_or((NONE, 0));
+            let link_idx_signed = link_of[s];
+            let link = if link_idx_signed < 0 { 0 } else { link_idx_signed as u32 };
+            let llen = if link_idx_signed < 0 { 0 } else { len_of[link_idx_signed as usize] };
+            out.fast.push(ScanSlot([e0.0, e0.1, e1.0, e1.1, lo as u32, hi as u32, link, llen]));
+        }
+        out.pos_state.resize(b.len(), 0);
+        for s in 0..nstates {
+            if primary[s] {
+                out.pos_state[firstpos[s] as usize] = s as u32;
+            }
+        }
     }
 
-    /// Build the endpos range structure (fix b): suffix-link children → DFS-order end-positions
-    /// (each state's endpos = a contiguous array range) → wavelet matrix over those positions.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn build_endpos(&self, out: &mut Sam, nstates: usize) {
-        // suffix-link children, CSR
-        let mut child_head = vec![0u32; nstates + 1];
-        for s in 1..nstates {
-            child_head[self.link[s] as usize + 1] += 1;
-        }
+    /// Build the endpos range structure (fix b): lay the end-positions out so every state's endpos
+    /// set is one contiguous slice `[dfs_in, dfs_in+dfs_cnt)` of `epos` (its subtree in the
+    /// suffix-link tree), fill the chain slot per state, and keep a sorted copy for the few states
+    /// holding more than `LINEAR_MAX` positions.
+    ///
+    /// No tree walk: a state's suffix link is always shorter than the state, so the states in
+    /// length order are a topological order of the link tree. One pass in decreasing length
+    /// accumulates subtree sizes and the largest position of each subtree; one pass in increasing
+    /// length hands each state a range inside its parent's, its own position first, its children's
+    /// ranges after. Any layout in which subtrees are contiguous serves the queries: a slice is
+    /// read as a set.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::needless_range_loop)]
+    fn build_endpos(&mut self, out: &mut Sam, nstates: usize, blen: usize) {
+        let (len_of, link_of, primary, firstpos) =
+            (self.len.as_slice(), self.link.as_slice(), self.primary.as_slice(), self.firstpos.as_slice());
+        // states in length order (counting sort: len <= blen)
+        self.child_head.clear();
+        self.child_head.resize(blen + 2, 0);
+        let start = self.child_head.as_mut_slice();
         for s in 0..nstates {
-            child_head[s + 1] += child_head[s];
+            start[len_of[s] as usize + 1] += 1;
         }
-        let mut child_arr = vec![0u32; nstates.saturating_sub(1)];
-        let mut fill = child_head.clone();
-        for s in 1..nstates {
-            let p = self.link[s] as usize;
-            child_arr[fill[p] as usize] = s as u32;
-            fill[p] += 1;
+        for l in 0..=blen {
+            start[l + 1] += start[l];
         }
-        // iterative DFS (enter/exit) from root → dfs_in / dfs_cnt + DFS-ordered end-positions;
-        // on exit (post-order, children done) accumulate lastpos = max end-position in subtree.
-        out.dfs_in.clear();
-        out.dfs_in.resize(nstates, 0);
-        out.dfs_cnt.clear();
-        out.dfs_cnt.resize(nstates, 0);
-        out.lastpos.clear();
-        out.lastpos.resize(nstates, 0);
-        out.epos.clear();
-        let mut stack: Vec<(u32, bool)> = vec![(0, false)];
-        while let Some((s, exit)) = stack.pop() {
-            let su = s as usize;
-            if exit {
-                out.dfs_cnt[su] = out.epos.len() as u32 - out.dfs_in[su];
-                let mut lp = if self.primary[su] { self.firstpos[su] } else { 0 };
-                for k in child_head[su]..child_head[su + 1] {
-                    lp = lp.max(out.lastpos[child_arr[k as usize] as usize]);
-                }
-                out.lastpos[su] = lp;
-                continue;
-            }
-            out.dfs_in[su] = out.epos.len() as u32;
-            if self.primary[su] {
-                out.epos.push(self.firstpos[su]);
-            }
-            stack.push((s, true));
-            for k in child_head[su]..child_head[su + 1] {
-                stack.push((child_arr[k as usize], false));
-            }
-        }
-        // merge-sort tree over the DFS-ordered end-positions, flattened CSR-style (build is a
-        // negligible fraction of runtime; queries hit the contiguous `seg_data` layout).
-        let n = out.epos.len();
-        let mut seg_n = 1usize;
-        while seg_n < n.max(1) {
-            seg_n <<= 1;
-        }
-        out.seg_n = seg_n;
-        let mut tree: Vec<Vec<u32>> = vec![Vec::new(); 2 * seg_n];
-        for i in 0..n {
-            tree[seg_n + i] = vec![out.epos[i]];
-        }
-        for i in (1..seg_n).rev() {
-            let (lhs, rhs) = (&tree[2 * i], &tree[2 * i + 1]);
-            let mut acc = Vec::with_capacity(lhs.len() + rhs.len());
-            let (mut x, mut y) = (0usize, 0usize);
-            while x < lhs.len() && y < rhs.len() {
-                if lhs[x] <= rhs[y] {
-                    acc.push(lhs[x]);
-                    x += 1;
-                } else {
-                    acc.push(rhs[y]);
-                    y += 1;
-                }
-            }
-            acc.extend_from_slice(&lhs[x..]);
-            acc.extend_from_slice(&rhs[y..]);
-            tree[i] = acc;
-        }
-        out.seg_off.clear();
-        out.seg_off.reserve(2 * seg_n + 1);
-        out.seg_data.clear();
-        let mut off = 0u32;
-        out.seg_off.push(0);
-        for node in &tree {
-            out.seg_data.extend_from_slice(node);
-            off += u32::try_from(node.len()).expect("epos fits u32");
-            out.seg_off.push(off);
-        }
-        // pack the query-hot per-state fields into one cache-line-friendly array
-        out.epmeta.clear();
-        out.epmeta.reserve(nstates);
+        self.child_arr.clear();
+        self.child_arr.resize(nstates, 0);
+        let by_len = self.child_arr.as_mut_slice();
+        self.off.clear();
+        self.off.extend_from_slice(&start[..=blen]);
+        let cursor = self.off.as_mut_slice();
         for s in 0..nstates {
-            out.epmeta.push([out.firstpos[s], out.lastpos[s], out.dfs_in[s], out.dfs_cnt[s]]);
+            let l = len_of[s] as usize;
+            by_len[cursor[l] as usize] = s as u32;
+            cursor[l] += 1;
         }
-        // Optimization B: interleave (node.len, node.link, link_len, epmeta) into one 32-byte slot
-        // per state so the chain walk's per-state data lands on a single cache line. Built lazily
-        // after epmeta + link_len; safe to do here because all the source arrays are finalized.
+        // decreasing length: subtree size (`cnt`) and largest position (`lastpos`) flow to the link
+        self.lastpos.clear();
+        self.lastpos.resize(nstates, 0);
+        let cnt = self.lastpos.as_mut_slice(); // scratch: subtree sizes
         out.chain_slot.clear();
         out.chain_slot.reserve(nstates);
         for s in 0..nstates {
-            let nd = out.node[s];
-            let m = out.epmeta[s];
-            out.chain_slot.push([
-                nd[0],            // len
-                nd[1],            // link
-                out.link_len[s],  // band_min source
-                0,                // padding for 32-byte alignment
-                m[0],             // firstpos
-                m[1],             // lastpos
-                m[2],             // dfs_in
-                m[3],             // dfs_cnt
-            ]);
+            let f = out.fast[s].0;
+            let own = if primary[s] { firstpos[s] } else { 0 };
+            out.chain_slot.push([len_of[s], f[6], f[7], u32::MAX, firstpos[s], own, 0, 0]);
+            cnt[s] = u32::from(primary[s]);
         }
+        let slots = out.chain_slot.as_mut_slice();
+        for &s in by_len[1..].iter().rev() {
+            let s = s as usize;
+            let p = link_of[s] as usize;
+            cnt[p] += cnt[s];
+            let lp = slots[s][5];
+            if lp > slots[p][5] {
+                slots[p][5] = lp;
+            }
+        }
+        // increasing length: ranges, parents before children; `cursor[s]` = next free slot in s's range
+        self.off.clear();
+        self.off.resize(nstates, 0);
+        let cursor = self.off.as_mut_slice();
+        out.epos.clear();
+        out.epos.resize(blen, 0);
+        let epos = out.epos.as_mut_slice();
+        slots[0][6] = 0;
+        slots[0][7] = cnt[0];
+        cursor[0] = 0;
+        for &s in by_len.iter() {
+            let s = s as usize;
+            if s != 0 {
+                let p = link_of[s] as usize;
+                let at = cursor[p];
+                cursor[p] += cnt[s];
+                slots[s][6] = at;
+                slots[s][7] = cnt[s];
+                cursor[s] = at;
+            }
+            if primary[s] {
+                epos[cursor[s] as usize] = firstpos[s];
+                cursor[s] += 1;
+            }
+        }
+        self.sort_big(out, nstates, blen);
     }
 
-    fn finalize(self) -> Sam {
-        let mut out = Sam::empty();
-        self.finalize_into(&mut out);
-        out
+    #[allow(clippy::cast_possible_truncation)]
+    fn sort_big(&mut self, out: &mut Sam, nstates: usize, blen: usize) {
+        // sorted copies for the big endpos sets (a handful of states: short, frequent substrings);
+        // positions are below `blen`, so a radix sort needs one pass per byte of that
+        let passes = ((usize::BITS - blen.leading_zeros()) as usize).div_ceil(8).max(1);
+        let scratch = &mut self.child_arr;
+        for s in 0..nstates {
+            let cnt = out.chain_slot[s][7] as usize;
+            if cnt > LINEAR_MAX {
+                let start = out.chain_slot[s][6] as usize;
+                let so = out.big_sorted.len();
+                out.big_sorted.extend_from_slice(&out.epos[start..start + cnt]);
+                radix_sort_u32(&mut out.big_sorted[so..], scratch, passes);
+                out.chain_slot[s][3] = so as u32;
+            }
+        }
+    }
+}
+
+/// LSD radix sort of `v` (byte digits, `passes` low bytes significant), `scratch` as the buffer.
+fn radix_sort_u32(v: &mut [u32], scratch: &mut Vec<u32>, passes: usize) {
+    let n = v.len();
+    scratch.clear();
+    scratch.resize(n, 0);
+    let mut counts = [0usize; 256];
+    for pass in 0..passes {
+        let shift = 8 * pass;
+        counts.fill(0);
+        for &x in v.iter() {
+            counts[((x >> shift) & 0xFF) as usize] += 1;
+        }
+        let mut sum = 0;
+        for c in &mut counts {
+            let k = *c;
+            *c = sum;
+            sum += k;
+        }
+        for &x in v.iter() {
+            let d = ((x >> shift) & 0xFF) as usize;
+            scratch[counts[d]] = x;
+            counts[d] += 1;
+        }
+        v.copy_from_slice(&scratch[..n]);
     }
 }
 
 /// Build (and finalize) the suffix automaton of `b` — prebuild once, reuse across pairs.
 #[must_use]
 pub fn build_sam(b: &[char]) -> Sam {
-    let mut bld = Builder::new(b.len());
-    for (i, &c) in b.iter().enumerate() {
-        bld.extend(c, i);
-    }
-    bld.finalize()
+    BUILDER.with_borrow_mut(|bld| {
+        bld.reset(b.len());
+        for (i, &c) in b.iter().enumerate() {
+            bld.extend(c, i);
+        }
+        bld.finalize(b)
+    })
 }
 
 /// Longest substring of `a[al..ar]` that occurs in `b[bl..br)`, using the **precomputed**
@@ -840,11 +960,27 @@ pub fn build_sam(b: &[char]) -> Sam {
 /// cap of 7 keeps ~99% of chains intact, capping at 5 keeps ~95%, etc. Setting `chain_cap =
 /// u32::MAX` recovers the exact behaviour. The caller (`gestalt_edge_with_ms` and friends)
 /// derives `chain_cap` from the user-supplied `delta` parameter via `delta_to_chain_cap`.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_arguments)]
+///
+/// `wlen[i]` is the caller's running upper bound on the in-window match ending at `i`: the
+/// windows of a Ratcliff–Obershelp recursion only ever shrink, so whatever this walk learns about
+/// position `i` — the exact longest match inside this window, or that nothing longer than the
+/// length it was pruned at exists — bounds every descendant window too, and the descendant's walk
+/// for `i` is pruned by it up front. The precomputed `fmatch[i]` is the longest match ending at
+/// `i` *anywhere* in `b`; on real code that is almost always long, so without this refinement a
+/// narrow window re-walks the chain for every position, level after level.
+///
+/// A window whose `b` side is at most [`DIRECT_B_MAX`] wide goes to [`longest_direct`] instead:
+/// half the recursion's windows are that narrow on real code, and there the chain walk climbs
+/// far for every `a` position (the precomputed matches lie outside the window) and mostly finds
+/// nothing, while a direct row-by-row comparison costs a handful of vector ops per position.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::too_many_arguments, clippy::too_many_lines)]
 fn longest_in(
+    a: &[char],
+    b: &[char],
     sam: &Sam,
     fstate: &[u32],
     fmatch: &[u32],
+    wlen: &mut [u32],
     al: usize,
     ar: usize,
     bl: usize,
@@ -853,19 +989,43 @@ fn longest_in(
 ) -> (usize, usize, usize) {
     #[cfg(feature = "instrument")]
     instr_inc(&instrument::LONGEST_IN_CALLS, 1);
+    if br - bl <= DIRECT_B_MAX {
+        return longest_direct(a, b, al, ar, bl, br);
+    }
     let blo = bl as u32;
     let hi = br as u32 - 1; // caller guarantees bl < br, so br >= 1
     let (mut best_len, mut best_a, mut best_b) = (0usize, 0usize, 0usize);
+    #[cfg(feature = "instrument")]
+    let (mut n_pos, mut n_walks, mut n_steps) = (0u64, 0u64, 0u64);
     // SAFETY: i ∈ [al, ar) ⊆ [0, n) = fstate.len() = fmatch.len(); `cur` is always a valid SAM
     // state (fstate entry or a suffix link), so chain_slot[cur] is in bounds (= nstates entries).
     #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
-        for i in al..ar {
+        // A match ending at `i+k` is at most `k` longer than one ending at `i` (drop its last `k`
+        // characters), and each of the three bounds below grows by at most one per position. So
+        // once position `i` is bounded by `eff <= best_len`, positions `i+1 ..= i+(best_len-eff)`
+        // cannot beat the best either and are jumped over: on similar strings a long block early
+        // in the window turns the walk over the rest of it into a few strides.
+        let mut i = al;
+        while i < ar {
             let cap = i - al + 1; // a-match ending at i can't start before `al`
-            let eff = (*fmatch.get_unchecked(i) as usize).min(cap);
-            if eff <= best_len {
-                continue; // can't beat the best — skip (dominant pruning)
+            let known = *wlen.get_unchecked(i) as usize; // what enclosing windows established
+            let eff = (*fmatch.get_unchecked(i) as usize).min(cap).min(known);
+            #[cfg(feature = "instrument")]
+            {
+                n_pos += 1;
             }
+            if eff <= best_len {
+                i += 1 + (best_len - eff); // can't beat the best — skip (dominant pruning)
+                continue;
+            }
+            #[cfg(feature = "instrument")]
+            {
+                n_walks += 1;
+            }
+            // what this walk establishes for `i`: the exact in-window match when it finds one, else
+            // the length it stopped at (nothing longer exists in this window, hence in any child)
+            let mut learned = 0usize;
             // walk the suffix-link chain from the precomputed state up; `curlen` is the usable length
             // at the current state (capped to the a-fragment), shrinking as we ascend.
             let mut cur = *fstate.get_unchecked(i);
@@ -875,35 +1035,39 @@ fn longest_in(
             // on, `cur` came from `link != 0` (we check before assigning). Hoisting the
             // entry-time `if cur == 0 { break }` out saves ≈4 k arm64 instructions per pair on
             // the bench corpus (-0.9 % retired) — no cycle change on this single-thread profile
-            // because the chain walk is latency-bound by the `node[cur] → link → node[link]`
-            // pointer chase, but it frees front-end issue bandwidth for the threaded path.
+            // because the chain walk is latency-bound by the `chain_slot[cur] → link →
+            // chain_slot[link]` pointer chase, but it frees front-end issue bandwidth.
             let mut chain_depth: u32 = 0;
             loop {
                 chain_depth += 1;
+                #[cfg(feature = "instrument")]
+                {
+                    n_steps += 1;
+                }
                 // Phase 3 approximate-RO cap: stop walking the chain past `chain_cap` ascended
                 // states. With cap=u32::MAX (default delta=0) this never fires; smaller caps
                 // trade tail accuracy for fewer pointer chases. Measurement on canonical Python:
                 // p95 chain depth = 5, p99 = 7 — capping at 5/7 truncates <5%/<1% of chains.
                 if chain_depth > chain_cap {
+                    learned = known; // approximate walk: learn nothing
                     break;
                 }
-                // OPTIMIZATION B: single 32-byte load of `chain_slot[cur]` brings the per-state
-                // hot fields into registers in ONE cache-line touch:
-                //   [0] = len   [1] = link   [2] = link_len   [3] = padding
-                //   [4..8] = epmeta (firstpos, lastpos, dfs_in, dfs_cnt) for max_le/min_in
-                // Replaces the three scattered loads (node[cur], link_len[cur], epmeta[cur]) that
-                // the chain walk used to do, each on its own cache line — PMU attribution showed
-                // L1D misses at 18 % of cycle budget split between those three arrays.
+                // One 32-byte load of `chain_slot[cur]` brings the per-state hot fields into
+                // registers in ONE cache-line touch:
+                //   [0] = len   [1] = link   [2] = link_len   [3] = sorted_off
+                //   [4..8] = firstpos, lastpos, dfs_in, dfs_cnt for max_le/min_in
+                // (These were three scattered loads on three cache lines; PMU attribution had
+                // L1D misses at 18 % of the cycle budget split between them.)
                 let cs = *sam.chain_slot.get_unchecked(cur as usize);
                 let curlen = eff.min(cs[0] as usize);
                 if curlen <= best_len {
+                    learned = curlen;
                     break;
                 }
                 let band_min = cs[2] as usize + 1;
                 if curlen >= band_min {
-                    // Reuse the epmeta bytes already in `cs` — no extra load needed.
-                    let m = [cs[4], cs[5], cs[6], cs[7]];
-                    if let Some(pmax) = sam.max_le_with_meta(&m, hi) {
+                    // The endpos metadata is already in `cs` — no extra load needed.
+                    if let Some(pmax) = sam.max_le_slot(&cs, hi) {
                         if pmax >= blo {
                             let l_window = (pmax - blo) as usize + 1; // window-cap on match len
                             let l = curlen.min(l_window); // = min(chain-cap, window-cap)
@@ -918,7 +1082,7 @@ fn longest_in(
                                     let pmin = if l == l_window {
                                         Some(pmax)
                                     } else {
-                                        sam.min_in_with_meta(&m, blo + l as u32 - 1, hi)
+                                        sam.min_in_slot(&cs, blo + l as u32 - 1, hi)
                                     };
                                     if let Some(pmin) = pmin {
                                         best_len = l;
@@ -926,6 +1090,7 @@ fn longest_in(
                                         best_b = pmin as usize + 1 - l;
                                     }
                                 }
+                                learned = l;
                                 break; // deepest qualifying state ⇒ longest in-window match here
                             }
                         }
@@ -937,8 +1102,66 @@ fn longest_in(
                 }
                 cur = link;
             }
+            if learned < known {
+                *wlen.get_unchecked_mut(i) = learned as u32;
+            }
             #[cfg(feature = "instrument")]
             instr_hist(&instrument::CHAIN_DEPTHS, chain_depth as usize);
+            // `learned` bounds this position's match, so the same stride applies from here
+            i += 1 + best_len.saturating_sub(learned);
+        }
+    }
+    #[cfg(feature = "instrument")]
+    {
+        let w = (ar - al).min(br - bl);
+        let k = (usize::BITS - w.leading_zeros()) as usize;
+        let k = k.min(23);
+        instr_inc(&instrument::WIN_CALLS[k], 1);
+        instr_inc(&instrument::WIN_POS[k], n_pos);
+        instr_inc(&instrument::WIN_WALKS[k], n_walks);
+        instr_inc(&instrument::WIN_STEPS[k], n_steps);
+        if best_len == 0 {
+            instr_inc(&instrument::WIN_ZERO[k], 1);
+        }
+        instrument::TL_STEPS.with(|c| c.set(c.get() + n_steps));
+        instrument::TL_CALLS.with(|c| c.set(c.get() + 1));
+    }
+    (best_a, best_b, best_len)
+}
+
+/// Widest `b` window [`longest_direct`] handles; wider ones walk the automaton. Measured on the
+/// name-gated workload: 4 and 8 are within noise of each other, 16 is slower, 64 is slower than
+/// no direct path at all — the row cost grows with the width while the walk's does not.
+const DIRECT_B_MAX: usize = 8;
+
+/// Longest common substring of `a[al..ar]` and `b[bl..br)` by direct comparison, for a narrow
+/// `b` window: difflib's own `find_longest_match` recurrence (`k[i][j] = k[i-1][j-1] + 1` on
+/// equal characters) over two rows of at most `DIRECT_B_MAX + 1` cells. The inner loop has no
+/// loop-carried dependency, so it vectorizes; the row's maximum is located only when it beats the
+/// best so far. Same result and tie-break as the chain walk: longest, then earliest in `a`, then
+/// earliest in `b` — rows go up in `i`, cells up in `j`, and only a strictly longer match replaces
+/// the best.
+#[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
+fn longest_direct(a: &[char], b: &[char], al: usize, ar: usize, bl: usize, br: usize) -> (usize, usize, usize) {
+    let wb = br - bl;
+    let bw: Vec<u32> = b[bl..br].iter().map(|&c| c as u32).collect();
+    let mut rows = [[0u32; DIRECT_B_MAX + 1]; 2];
+    let (mut best_len, mut best_a, mut best_b) = (0usize, 0usize, 0usize);
+    for (r, i) in (al..ar).enumerate() {
+        let (lo, hi) = rows.split_at_mut(1);
+        let (prev, cur) = if r & 1 == 0 { (&lo[0], &mut hi[0]) } else { (&hi[0], &mut lo[0]) };
+        let ai = a[i] as u32;
+        let mut rowmax = 0u32;
+        for ((c, &p), &bj) in cur[1..=wb].iter_mut().zip(&prev[..wb]).zip(&bw) {
+            let k = if ai == bj { p + 1 } else { 0 };
+            *c = k;
+            rowmax = rowmax.max(k);
+        }
+        if rowmax as usize > best_len {
+            let j = cur[1..=wb].iter().position(|&k| k == rowmax).unwrap_or(0);
+            best_len = rowmax as usize;
+            best_a = i + 1 - best_len;
+            best_b = bl + j + 1 - best_len;
         }
     }
     (best_a, best_b, best_len)
@@ -974,10 +1197,48 @@ pub fn delta_to_chain_cap(delta: f64) -> u32 {
     cap.max(1)
 }
 
+/// Fill the matching statistics of `a`'s common prefix with `b` (the string `sam_b` was built
+/// from): position `i` of the prefix is matched in full by `b`'s own prefix, so its state is the
+/// one created for position `i` and its match length `i + 1`. Returns the prefix length.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn prefix_fill(a: &[char], sam_b: &Sam, fstate: &mut [u32], fmatch: &mut [u32]) -> usize {
+    let b = sam_b.pos_state.as_slice();
+    let n = a.len().min(b.len());
+    let mut pre = 0;
+    // `b`'s characters are not stored; the state's first inline transition continues along `b`
+    // and its target is the next position's state, which is what the comparison needs
+    let fast = sam_b.fast.as_slice();
+    let mut st = 0u32;
+    while pre < n {
+        let f = fast[st as usize].0;
+        let key = a[pre] as u32;
+        let next = if st == 0 {
+            let ci = key as usize;
+            if ci < ROOT_TBL && sam_b.root_next[ci] >= 0 { sam_b.root_next[ci] as u32 } else { break }
+        } else if f[0] == key && f[1] == b[pre] {
+            f[1]
+        } else {
+            break;
+        };
+        if next != b[pre] {
+            break;
+        }
+        fstate[pre] = next;
+        fmatch[pre] = pre as u32 + 1;
+        st = next;
+        pre += 1;
+    }
+    pre
+}
+
 /// Window-independent matching statistics of `a` vs `sam_b`, filled into reused buffers: for each
 /// i, `(state, matched)` where `matched` = longest suffix of `a[..=i]` occurring anywhere in b.
 /// One O(|a|) scan, reused by every recursion node (no per-node re-scan). Reusing the caller's
 /// buffers avoids a per-pair allocation (was ~10% of the all-pairs join).
+///
+/// Per character the scan first tries the state's inline transition (`Sam::fast`): on similar
+/// strings a match extends for hundreds of characters, and each of those is then one 16-byte
+/// load instead of a node load plus a binary search over the edge slice.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn matching_stats_into(a: &[char], sam_b: &Sam, fstate: &mut Vec<u32>, fmatch: &mut Vec<u32>) {
     let n = a.len();
@@ -996,46 +1257,63 @@ fn matching_stats_into(a: &[char], sam_b: &Sam, fstate: &mut Vec<u32>, fmatch: &
     }
     // Hoist the SAM arrays into locals so the compiler keeps base pointers in registers and
     // doesn't reload them through `sam_b` each iteration; transition is hand-inlined.
-    let node = sam_b.node.as_slice();
     let edges = sam_b.edges.as_slice();
     let root = sam_b.root_next.as_slice();
-    let mut state = 0u32;
-    let mut matched = 0u32;
-    // SAFETY: `state` is always a valid SAM state index (< nstates = node.len()): it starts at the
-    // root (0) and only ever becomes a transition target (an edge's low bits, a valid state) or a
-    // suffix link (node[..][1], a valid state). So node[state] and node[link] are in bounds; the edge
-    // range [edge_lo, edge_hi) ⊆ [0, edges.len()); `ci < ROOT_TBL == root.len()`; `i < n == fstate.len()`.
+    let fast = sam_b.fast.as_slice();
+    // A common prefix of `a` and `b` is walked by the automaton along `b`'s own states with the
+    // match growing by one per character; those entries are written directly (same-named code
+    // shares long prefixes) and the walk starts where the prefix ends.
+    let pre = prefix_fill(a, sam_b, fstate, fmatch);
+    let mut state = if pre == 0 { 0 } else { sam_b.pos_state[pre - 1] };
+    let mut matched = pre as u32;
+    // SAFETY: `state` is always a valid SAM state index (< nstates = fast.len()): it starts at
+    // the root (0) or a position's state and only ever becomes a transition target (an inline
+    // target or an edge's low bits, both valid states) or a suffix link (`fast[..][6]`, a valid
+    // state). So fast[state] is in bounds; the edge range [edge_lo, edge_hi) ⊆ [0, edges.len());
+    // `ci < ROOT_TBL == root.len()`; `i < n == fstate.len()`.
     #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
-        for i in 0..n {
+        for i in pre..n {
             let c = *a.get_unchecked(i);
+            let key = c as u32;
             loop {
-                // inline `transition(state, c)` → next state, or -1. The non-root branch loads
-                // node[state] ONCE for both the edge range and (on miss) the suffix link — one cache line.
-                let nx: i64 = if state == 0 {
+                if state == 0 {
                     let ci = c as usize;
-                    if ci < ROOT_TBL {
+                    let nx: i64 = if ci < ROOT_TBL {
                         i64::from(*root.get_unchecked(ci))
                     } else {
-                        let nd = node.get_unchecked(0);
-                        csr_lookup(edges, nd[2] as usize, nd[3] as usize, c)
+                        let f = fast.get_unchecked(0).0;
+                        csr_lookup(edges, f[4] as usize, f[5] as usize, c)
+                    };
+                    if nx >= 0 {
+                        state = nx as u32;
+                        matched += 1;
+                    } else {
+                        matched = 0;
                     }
-                } else {
-                    let nd = node.get_unchecked(state as usize);
-                    csr_lookup(edges, nd[2] as usize, nd[3] as usize, c)
-                };
-                if nx >= 0 {
-                    state = nx as u32;
+                    break;
+                }
+                let f = fast.get_unchecked(state as usize).0;
+                if f[0] == key {
+                    state = f[1];
                     matched += 1;
                     break;
                 }
-                if state == 0 {
-                    matched = 0;
+                if f[2] == key {
+                    state = f[3];
+                    matched += 1;
                     break;
                 }
-                let link = node.get_unchecked(state as usize)[1]; // same line as the edge-range load
-                state = link;
-                matched = node.get_unchecked(link as usize)[0]; // len(link)
+                if f[5] - f[4] > 2 {
+                    let nx = csr_lookup(edges, f[4] as usize, f[5] as usize, c);
+                    if nx >= 0 {
+                        state = nx as u32;
+                        matched += 1;
+                        break;
+                    }
+                }
+                state = f[6]; // suffix link
+                matched = f[7]; // len(link)
             }
             *fstate.get_unchecked_mut(i) = state;
             *fmatch.get_unchecked_mut(i) = matched;
@@ -1050,6 +1328,17 @@ fn matching_stats_into(a: &[char], sam_b: &Sam, fstate: &mut Vec<u32>, fmatch: &
 fn csr_lookup(edges: &[u64], mut lo: usize, hi: usize, c: char) -> i64 {
     let mut hi = hi;
     let key = c as u32;
+    if hi - lo <= 8 {
+        // a short range: one predictable loop beats a binary search's data-dependent branches
+        for k in lo..hi {
+            // SAFETY: k ∈ [lo, hi) ⊆ [0, edges.len()] (callers pass a state's edge range).
+            let e = unsafe { *edges.get_unchecked(k) };
+            if (e >> 32) as u32 == key {
+                return i64::from((e & 0xFFFF_FFFF) as u32);
+            }
+        }
+        return -1;
+    }
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         // SAFETY: callers pass lo,hi from a state's edge range ⊆ [0, edges.len()]; `mid ∈ [lo, hi)`.
@@ -1128,6 +1417,204 @@ fn ub_from_fmatch(fmatch: &[u32], buf: &mut Vec<u32>) -> u32 {
     }
 }
 
+/// A pending recursion window, ordered by the size of its smaller side (a max-heap key).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Window {
+    key: usize,
+    al: usize,
+    ar: usize,
+    bl: usize,
+    br: usize,
+}
+
+impl Window {
+    fn new(al: usize, ar: usize, bl: usize, br: usize) -> Self {
+        Self { key: (ar - al).min(br - bl), al, ar, bl, br }
+    }
+}
+
+impl Ord for Window {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key).then_with(|| other.al.cmp(&self.al))
+    }
+}
+
+impl PartialOrd for Window {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+thread_local! {
+    /// Reused window heap for the early-exit recursions (largest window first).
+    static HEAP_BUF: std::cell::RefCell<std::collections::BinaryHeap<Window>> =
+        const { std::cell::RefCell::new(std::collections::BinaryHeap::new()) };
+    /// Reused per-position window bound for `longest_in` (see its `wlen` parameter).
+    static WLEN_BUF: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with a fresh (all-`u32::MAX`) window bound for a string of `na` positions.
+fn with_wlen<R>(na: usize, f: impl FnOnce(&mut [u32]) -> R) -> R {
+    WLEN_BUF.with_borrow_mut(|w| {
+        w.clear();
+        w.resize(na, u32::MAX);
+        f(w)
+    })
+}
+
+/// What a bounded scan concluded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scan {
+    /// The buffers hold the complete matching statistics.
+    Full,
+    /// Some position's match reached `accept_at`: that common substring alone bounds M from below.
+    Accept,
+}
+
+/// `matching_stats_into` with an **exact** early exit decided while `a` is still being walked:
+/// `Accept` the moment `fmatch[i] >= accept_at`. Ratcliff–Obershelp's first block is the longest
+/// common substring, so M is at least any common substring's length — a match of `accept_at`
+/// characters proves `M >= accept_at` before a single recursion step. On `Full` the buffers hold
+/// the complete statistics, bit-identical to `matching_stats_into`.
+///
+/// (A reject exit from the non-overlapping-interval bound on `fmatch` was tried here and never
+/// fired on real code: dissimilar functions still share long substrings, so every position's
+/// `fmatch` is long and the bound stays near `|a|`; what makes their ratio low is the order the
+/// blocks must come in, which only the recursion sees.)
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn matching_stats_bounded(
+    a: &[char],
+    sam_b: &Sam,
+    fstate: &mut Vec<u32>,
+    fmatch: &mut Vec<u32>,
+    accept_at: u32,
+) -> Scan {
+    let n = a.len();
+    fstate.clear();
+    fstate.reserve(n);
+    fmatch.clear();
+    fmatch.reserve(n);
+    // SAFETY: u32 has no invalid bit patterns; every index [0, n) of both buffers is written by
+    // the loop below before it is read.
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    unsafe {
+        fstate.set_len(n);
+        fmatch.set_len(n);
+    }
+    let edges = sam_b.edges.as_slice();
+    let root = sam_b.root_next.as_slice();
+    let fast = sam_b.fast.as_slice();
+    let pre = prefix_fill(a, sam_b, fstate, fmatch);
+    if pre as u32 >= accept_at {
+        return Scan::Accept;
+    }
+    let mut state = if pre == 0 { 0 } else { sam_b.pos_state[pre - 1] };
+    let mut matched = pre as u32;
+    // SAFETY: as in `matching_stats_into` — `state` is always a valid state index, edge ranges
+    // are within `edges`, `ci < ROOT_TBL`, `i < n`.
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    unsafe {
+        for i in pre..n {
+            let c = *a.get_unchecked(i);
+            let key = c as u32;
+            loop {
+                if state == 0 {
+                    let ci = c as usize;
+                    let nx: i64 = if ci < ROOT_TBL {
+                        i64::from(*root.get_unchecked(ci))
+                    } else {
+                        let f = fast.get_unchecked(0).0;
+                        csr_lookup(edges, f[4] as usize, f[5] as usize, c)
+                    };
+                    if nx >= 0 {
+                        state = nx as u32;
+                        matched += 1;
+                    } else {
+                        matched = 0;
+                    }
+                    break;
+                }
+                let f = fast.get_unchecked(state as usize).0;
+                if f[0] == key {
+                    state = f[1];
+                    matched += 1;
+                    break;
+                }
+                if f[2] == key {
+                    state = f[3];
+                    matched += 1;
+                    break;
+                }
+                if f[5] - f[4] > 2 {
+                    let nx = csr_lookup(edges, f[4] as usize, f[5] as usize, c);
+                    if nx >= 0 {
+                        state = nx as u32;
+                        matched += 1;
+                        break;
+                    }
+                }
+                state = f[6]; // suffix link
+                matched = f[7]; // len(link)
+            }
+            *fstate.get_unchecked_mut(i) = state;
+            *fmatch.get_unchecked_mut(i) = matched;
+            if matched >= accept_at {
+                return Scan::Accept;
+            }
+        }
+    }
+    Scan::Full
+}
+
+/// Length of the longest common prefix of `a` and `b` plus that of their longest common suffix
+/// (the two never overlap when the sum is capped at `min(|a|, |b|)`): both are common substrings,
+/// so Ratcliff–Obershelp's first block — the longest common substring — is at least the larger of
+/// them, and `M` is at least that. Cheap (two straight compares) and on same-named code often
+/// enough to decide a pair before the scan.
+fn common_ends(a: &[char], b: &[char]) -> usize {
+    let n = a.len().min(b.len());
+    let pre = a.iter().zip(b).take(n).take_while(|(x, y)| x == y).count();
+    if pre == n {
+        return n;
+    }
+    let suf = a.iter().rev().zip(b.iter().rev()).take(n - pre).take_while(|(x, y)| x == y).count();
+    pre.max(suf)
+}
+
+/// Exact edge test `RO(a,b) >= threshold`: the bounded scan accepts a pair with a single block as
+/// long as `need` before any recursion, the rest run the two-sided early-exit recursion. No ratio
+/// comes out — the cluster minimum pass computes the exact values it needs under its own cap.
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[must_use]
+pub fn gestalt_edge_bounded(a: &[char], b: &[char], sam_b: &Sam, threshold: f64) -> bool {
+    let na = a.len();
+    let nb = b.len();
+    let total = na + nb;
+    if total == 0 {
+        return true;
+    }
+    let need = (threshold * total as f64 / 2.0).ceil() as usize;
+    if need == 0 {
+        return true;
+    }
+    if na == 0 || nb == 0 {
+        return false;
+    }
+    if common_ends(a, b) >= need {
+        return true;
+    }
+    let need32 = u32::try_from(need).unwrap_or(u32::MAX);
+    MS_BUF.with_borrow_mut(|(fstate, fmatch)| {
+        let r = match matching_stats_bounded(a, sam_b, fstate, fmatch, need32) {
+            Scan::Accept => true,
+            Scan::Full => gestalt_qualifies_ms(a, b, sam_b, threshold, fstate, fmatch),
+        };
+        #[cfg(feature = "instrument")]
+        instrument::pair_done(1);
+        r
+    })
+}
+
 /// Test-only access to `matching_stats_into` — used by `corpus_sa` tests to verify the SA-based
 /// fmatch is byte-for-byte identical to the SAM-based fmatch.
 #[doc(hidden)]
@@ -1162,20 +1649,22 @@ fn gestalt_m_recur(a: &[char], b: &[char], sam_b: &Sam, fstate: &[u32], fmatch: 
     let n = a.len();
     let mut total = 0usize;
     STACK_BUF.with_borrow_mut(|stack| {
-        stack.clear();
-        stack.push((0, n, 0, b.len()));
-        while let Some((al, ar, bl, br)) = stack.pop() {
-            if al >= ar || bl >= br {
-                continue;
+        with_wlen(n, |wlen| {
+            stack.clear();
+            stack.push((0, n, 0, b.len()));
+            while let Some((al, ar, bl, br)) = stack.pop() {
+                if al >= ar || bl >= br {
+                    continue;
+                }
+                let (i, j, l) = longest_in(a, b, sam_b, fstate, fmatch, wlen, al, ar, bl, br, u32::MAX);
+                if l == 0 {
+                    continue;
+                }
+                total += l;
+                stack.push((al, i, bl, j));
+                stack.push((i + l, ar, j + l, br));
             }
-            let (i, j, l) = longest_in(sam_b, fstate, fmatch, al, ar, bl, br, u32::MAX);
-            if l == 0 {
-                continue;
-            }
-            total += l;
-            stack.push((al, i, bl, j));
-            stack.push((i + l, ar, j + l, br));
-        }
+        });
     });
     total
 }
@@ -1207,12 +1696,12 @@ pub fn gestalt_qualifies(a: &[char], b: &[char], sam_b: &Sam, threshold: f64) ->
     }
     MS_BUF.with_borrow_mut(|(fstate, fmatch)| {
         matching_stats_into(a, sam_b, fstate, fmatch);
-        gestalt_qualifies_ms(n, nb, sam_b, threshold, fstate, fmatch)
+        gestalt_qualifies_ms(a, b, sam_b, threshold, fstate, fmatch)
     })
 }
 
 /// The threshold early-exit recursion given **precomputed** matching statistics (`fstate`/`fmatch`
-/// for `a` of length `na` vs `sam_b`). Split out so the scan can be done in an MLP batch separately.
+/// for `a` vs `sam_b`, the automaton of `b`). Split out so the scan can be done separately.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -1220,7 +1709,9 @@ pub fn gestalt_qualifies(a: &[char], b: &[char], sam_b: &Sam, threshold: f64) ->
     clippy::many_single_char_names
 )]
 #[must_use]
-pub fn gestalt_qualifies_ms(na: usize, nb: usize, sam_b: &Sam, threshold: f64, fstate: &[u32], fmatch: &[u32]) -> bool {
+pub fn gestalt_qualifies_ms(a: &[char], b: &[char], sam_b: &Sam, threshold: f64, fstate: &[u32], fmatch: &[u32]) -> bool {
+    let na = a.len();
+    let nb = b.len();
     let total = na + nb;
     if total == 0 {
         return true;
@@ -1232,32 +1723,37 @@ pub fn gestalt_qualifies_ms(na: usize, nb: usize, sam_b: &Sam, threshold: f64, f
     if na == 0 || nb == 0 {
         return false;
     }
-    STACK_BUF.with_borrow_mut(|stack| {
-        let mut m = 0usize;
-        let mut pending = na.min(nb);
-        stack.clear();
-        stack.push((0, na, 0, nb));
-        while let Some((al, ar, bl, br)) = stack.pop() {
-            pending -= (ar - al).min(br - bl);
-            if al >= ar || bl >= br {
-                continue;
+    HEAP_BUF.with_borrow_mut(|heap| {
+        with_wlen(na, |wlen| {
+            let mut m = 0usize;
+            let mut pending = na.min(nb);
+            heap.clear();
+            heap.push(Window::new(0, na, 0, nb));
+            // largest window first: its block removes the most from the bound, so both exits
+            // — `m >= need` and `m + pending < need` — are reached in fewer windows
+            while let Some(w) = heap.pop() {
+                let (al, ar, bl, br) = (w.al, w.ar, w.bl, w.br);
+                pending -= (ar - al).min(br - bl);
+                if al >= ar || bl >= br {
+                    continue;
+                }
+                let (i, j, l) = longest_in(a, b, sam_b, fstate, fmatch, wlen, al, ar, bl, br, u32::MAX);
+                if l == 0 {
+                    continue;
+                }
+                m += l;
+                if m >= need {
+                    return true;
+                }
+                pending += (i - al).min(j - bl) + (ar - i - l).min(br - j - l);
+                if m + pending < need {
+                    return false;
+                }
+                heap.push(Window::new(al, i, bl, j));
+                heap.push(Window::new(i + l, ar, j + l, br));
             }
-            let (i, j, l) = longest_in(sam_b, fstate, fmatch, al, ar, bl, br, u32::MAX);
-            if l == 0 {
-                continue;
-            }
-            m += l;
-            if m >= need {
-                return true;
-            }
-            pending += (i - al).min(j - bl) + (ar - i - l).min(br - j - l);
-            if m + pending < need {
-                return false;
-            }
-            stack.push((al, i, bl, j));
-            stack.push((i + l, ar, j + l, br));
-        }
-        m >= need
+            m >= need
+        })
     })
 }
 
@@ -1287,7 +1783,10 @@ pub fn gestalt_edge(a: &[char], b: &[char], sam_b: &Sam, threshold: f64) -> Opti
     }
     MS_BUF.with_borrow_mut(|(fstate, fmatch)| {
         matching_stats_into(a, sam_b, fstate, fmatch);
-        gestalt_edge_with_ms(a, b, sam_b, fstate, fmatch, threshold)
+        let r = gestalt_edge_with_ms(a, b, sam_b, fstate, fmatch, threshold);
+        #[cfg(feature = "instrument")]
+        instrument::pair_done(0);
+        r
     })
 }
 
@@ -1368,7 +1867,7 @@ fn gestalt_edge_with_ms_inner(
                 zero += 1;
             } else {
                 nz += 1;
-                sum += f as u64;
+                sum += u64::from(f);
             }
         }
         instr_inc(&instrument::FMATCH_ZERO, zero);
@@ -1383,40 +1882,42 @@ fn gestalt_edge_with_ms_inner(
     // `src/new/PERF_MAP.md`'s "Tombstones" section and the `ub_from_fmatch` helper just above —
     // kept around but unused in case a different call shape makes it worth re-trying.
     STACK_BUF.with_borrow_mut(|stack| {
-        let mut m = 0usize;
-        let mut pending = na.min(nb);
-        stack.clear();
-        stack.push((0, na, 0, nb));
-        #[cfg(feature = "instrument")]
-        let mut max_depth: usize = 1;
-        while let Some((al, ar, bl, br)) = stack.pop() {
+        with_wlen(na, |wlen| {
+            let mut m = 0usize;
+            let mut pending = na.min(nb);
+            stack.clear();
+            stack.push((0, na, 0, nb));
             #[cfg(feature = "instrument")]
-            {
-                if stack.len() + 1 > max_depth {
-                    max_depth = stack.len() + 1;
-                }
-            }
-            pending -= (ar - al).min(br - bl);
-            if al >= ar || bl >= br {
-                continue;
-            }
-            let (i, j, l) = longest_in(sam_b, fstate, fmatch, al, ar, bl, br, chain_cap);
-            if l == 0 {
-                continue;
-            }
-            m += l;
-            pending += (i - al).min(j - bl) + (ar - i - l).min(br - j - l);
-            if m + pending < need {
+            let mut max_depth: usize = 1;
+            while let Some((al, ar, bl, br)) = stack.pop() {
                 #[cfg(feature = "instrument")]
-                instr_hist(&instrument::RECURSION_DEPTHS, max_depth);
-                return None; // upper bound below the bar ⇒ certified non-edge, abort
+                {
+                    if stack.len() + 1 > max_depth {
+                        max_depth = stack.len() + 1;
+                    }
+                }
+                pending -= (ar - al).min(br - bl);
+                if al >= ar || bl >= br {
+                    continue;
+                }
+                let (i, j, l) = longest_in(a, b, sam_b, fstate, fmatch, wlen, al, ar, bl, br, chain_cap);
+                if l == 0 {
+                    continue;
+                }
+                m += l;
+                pending += (i - al).min(j - bl) + (ar - i - l).min(br - j - l);
+                if m + pending < need {
+                    #[cfg(feature = "instrument")]
+                    instr_hist(&instrument::RECURSION_DEPTHS, max_depth);
+                    return None; // upper bound below the bar ⇒ certified non-edge, abort
+                }
+                stack.push((al, i, bl, j));
+                stack.push((i + l, ar, j + l, br));
             }
-            stack.push((al, i, bl, j));
-            stack.push((i + l, ar, j + l, br));
-        }
-        #[cfg(feature = "instrument")]
-        instr_hist(&instrument::RECURSION_DEPTHS, max_depth);
-        (m >= need).then(|| 2.0 * m as f64 / total as f64)
+            #[cfg(feature = "instrument")]
+            instr_hist(&instrument::RECURSION_DEPTHS, max_depth);
+            (m >= need).then(|| 2.0 * m as f64 / total as f64)
+        })
     })
 }
 
@@ -1444,17 +1945,39 @@ pub fn gestalt_ratio_capped(a: &[char], b: &[char], sam_b: &Sam, cap: f64) -> f6
     }
     // ratio > cap ⟺ 2M/total > cap ⟺ M > cap·total/2 ⟺ M >= ⌊cap·total/2⌋ + 1.
     let exceed = (cap * total as f64 / 2.0).floor() as usize + 1;
+    if common_ends(a, b) >= exceed {
+        return 2.0;
+    }
     MS_BUF.with_borrow_mut(|(fstate, fmatch)| {
-        matching_stats_into(a, sam_b, fstate, fmatch);
-        STACK_BUF.with_borrow_mut(|stack| {
+        // A single common substring of `exceed` characters already proves ratio > cap.
+        let accept_at = u32::try_from(exceed).unwrap_or(u32::MAX);
+        let scan = matching_stats_bounded(a, sam_b, fstate, fmatch, accept_at);
+        let r = if scan == Scan::Accept { 2.0 } else { capped_recursion(a, b, sam_b, fstate, fmatch, exceed) };
+        #[cfg(feature = "instrument")]
+        instrument::pair_done(2);
+        r
+    })
+}
+
+/// The recursion of [`gestalt_ratio_capped`] over precomputed matching statistics: the exact
+/// ratio if `M < exceed`, else `2.0` the instant the running total reaches `exceed`.
+#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+fn capped_recursion(a: &[char], b: &[char], sam_b: &Sam, fstate: &[u32], fmatch: &[u32], exceed: usize) -> f64 {
+    let na = a.len();
+    let nb = b.len();
+    let total = na + nb;
+    HEAP_BUF.with_borrow_mut(|heap| {
+        with_wlen(na, |wlen| {
             let mut m = 0usize;
-            stack.clear();
-            stack.push((0, na, 0, nb));
-            while let Some((al, ar, bl, br)) = stack.pop() {
+            heap.clear();
+            heap.push(Window::new(0, na, 0, nb));
+            // largest window first: the biggest blocks come earliest, so the prune fires sooner
+            while let Some(w) = heap.pop() {
+                let (al, ar, bl, br) = (w.al, w.ar, w.bl, w.br);
                 if al >= ar || bl >= br {
                     continue;
                 }
-                let (i, j, l) = longest_in(sam_b, fstate, fmatch, al, ar, bl, br, u32::MAX);
+                let (i, j, l) = longest_in(a, b, sam_b, fstate, fmatch, wlen, al, ar, bl, br, u32::MAX);
                 if l == 0 {
                     continue;
                 }
@@ -1462,8 +1985,8 @@ pub fn gestalt_ratio_capped(a: &[char], b: &[char], sam_b: &Sam, cap: f64) -> f6
                 if m >= exceed {
                     return 2.0; // ratio > cap ⇒ cannot be the minimum; prune (any value > cap works)
                 }
-                stack.push((al, i, bl, j));
-                stack.push((i + l, ar, j + l, br));
+                heap.push(Window::new(al, i, bl, j));
+                heap.push(Window::new(i + l, ar, j + l, br));
             }
             2.0 * m as f64 / total as f64 // full exact M ⇒ exact ratio (<= cap)
         })
