@@ -164,7 +164,14 @@ impl BatchCosineGpu {
 }
 
 /// Copy `data` into a fresh shared (UMA) buffer — one memcpy into unified memory (zero device copy).
+/// An empty slice gets a 1-byte zeroed buffer instead: `new_buffer_with_data` would memcpy 1 byte
+/// from `data.as_ptr()`, which is a dangling pointer for empty slices (a real SIGSEGV once hapax
+/// stripping made fully-empty CSR arrays reachable). The kernel never reads the buffer when the
+/// corpus has no entries (every row's `indptr` window is empty), so the 1-byte placeholder is inert.
 fn upload<T: Copy>(device: &Device, data: &[T]) -> Buffer {
-    let bytes = (std::mem::size_of_val(data) as NSUInteger).max(1);
+    if data.is_empty() {
+        return device.new_buffer(1, MTLResourceOptions::StorageModeShared);
+    }
+    let bytes = std::mem::size_of_val(data) as NSUInteger;
     device.new_buffer_with_data(data.as_ptr().cast::<c_void>(), bytes, MTLResourceOptions::StorageModeShared)
 }

@@ -58,6 +58,41 @@ pub struct Corpus {
     maxw: Vec<f64>,
 }
 
+/// Merge duplicate dims of one row (weights summed in input order within each dim group, dims in
+/// ascending dim order — deterministic, unlike the per-call-random `HashMap` iteration order of the
+/// previous implementation) and L2-normalise. A row whose norm is 0 (all weights 0) becomes empty.
+#[must_use]
+fn norm_row(r: &[(u32, f64)]) -> Vec<(u32, f64)> {
+    let mut v = r.to_vec();
+    v.sort_by_key(|&(d, _)| d); // stable: preserves input order within each duplicate group
+    let mut out: Vec<(u32, f64)> = Vec::with_capacity(v.len());
+    let mut sq = 0.0;
+    let mut iter = v.into_iter();
+    if let Some((mut d, mut w)) = iter.next() {
+        for (d2, w2) in iter {
+            if d2 == d {
+                w += w2;
+            } else {
+                sq += w * w;
+                out.push((d, w));
+                d = d2;
+                w = w2;
+            }
+        }
+        sq += w * w;
+        out.push((d, w));
+    }
+    let norm = sq.sqrt();
+    if norm > 0.0 {
+        for (_, w) in &mut out {
+            *w /= norm;
+        }
+        out
+    } else {
+        Vec::new()
+    }
+}
+
 impl Corpus {
     /// Number of vectors.
     #[must_use]
@@ -131,61 +166,131 @@ impl Corpus {
     /// Build a corpus from raw `(dim, weight)` rows. Duplicate dims within a row are summed; each row
     /// is L2-normalised; dims are relabelled to a global rank by decreasing max weight. Weights are
     /// expected non-negative (the prefix-filter bound requires it — IDF weights satisfy this).
+    ///
+    /// The build is rayon-parallel (per-row normalise, global max-weight reduction, per-row relabel
+    /// into the CSR) and **deterministic**: rows are merged in dim order, the rank is a function of
+    /// the exact per-dim max weight (ties by dim id), and parallel reductions only combine
+    /// order-independent operations — the resulting corpus is a pure function of `rows`.
+    ///
+    /// Dims that occur in exactly one row (`df = 1`) are dropped from the rank and the rows **after**
+    /// normalisation: no pair shares them, so they contribute exactly `0.0` to every pairwise dot and
+    /// their postings are never walked — the join output is bit-identical with or without them, while
+    /// the index and the rows get smaller and the pruning bounds tighter. Normalising over the full
+    /// row first is what keeps the surviving weights — and every emitted score — unchanged.
     #[must_use]
     pub fn from_rows(rows: &[Vec<(u32, f64)>]) -> Corpus {
+        Self::from_rows_with(rows, true)
+    }
+
+    /// Build a corpus from normalized rows with optional **hapax stripping**. Hapax dims (present in
+    /// exactly one row) are dropped from the rank and the rows **after** L2 normalisation — no pair
+    /// shares them, so they contribute exactly `0.0` to every pairwise dot, their postings are never
+    /// walked (probes visit only postings of their own dims), and dropping their mass only tightens
+    /// the Cauchy–Schwarz bounds (which are filters). The join output is therefore bit-identical
+    /// with stripping on or off; the strip just shrinks the index/rows and prunes harder. Normalising
+    /// over the full row first keeps the surviving weights — and every emitted score — unchanged
+    /// (removing the mass *before* normalisation would rescale the weights and change the indexing).
+    /// `strip_hapax = false` is the un-stripped reference build, used by tests to pin the equality.
+    fn from_rows_with(rows: &[Vec<(u32, f64)>], strip_hapax: bool) -> Corpus {
         let n = rows.len();
-        // 1. Merge duplicate dims + L2-normalise each row (kept as (orig_dim, weight)).
-        let normed: Vec<Vec<(u32, f64)>> = rows
-            .iter()
-            .map(|r| {
-                let mut m: HashMap<u32, f64> = HashMap::new();
-                for &(d, w) in r {
-                    *m.entry(d).or_insert(0.0) += w;
+        // 1. Merge duplicate dims + L2-normalise each row (kept as (orig_dim, weight)), in parallel.
+        let normed: Vec<Vec<(u32, f64)>> = rows.par_iter().map(|r| norm_row(r)).collect();
+        // 2. Document frequency per original dim (over the normalised rows) — a parallel
+        //    fold+reduce of exact counts, so the chunking cannot change the result.
+        let df: HashMap<u32, u32> = normed
+            .par_iter()
+            .fold(HashMap::new, |mut m, v| {
+                for &(d, _) in v {
+                    *m.entry(d).or_insert(0) += 1;
                 }
-                let norm = m.values().map(|w| w * w).sum::<f64>().sqrt();
-                if norm > 0.0 {
-                    m.into_iter().map(|(d, w)| (d, w / norm)).collect()
-                } else {
-                    Vec::new()
-                }
+                m
             })
-            .collect();
-        // 2. Max normalised weight per original dim.
-        let mut maxw_orig: HashMap<u32, f64> = HashMap::new();
-        for v in &normed {
-            for &(d, w) in v {
-                let e = maxw_orig.entry(d).or_insert(0.0);
-                if w > *e {
-                    *e = w;
+            .reduce(HashMap::new, |mut a, mut b| {
+                if a.len() < b.len() {
+                    std::mem::swap(&mut a, &mut b);
                 }
-            }
-        }
-        // 3. Rank dims by (max weight ASC, dim asc) → dense global order. Ascending so the common,
+                for (d, c) in b {
+                    *a.entry(d).or_insert(0) += c;
+                }
+                a
+            });
+        // A dim earns a rank only if some pair could share it. `strip_hapax = false` keeps every
+        // dim (test-only reference).
+        let shared = |d: u32| !strip_hapax || df.get(&d).is_some_and(|&c| c >= 2);
+        // 3. Max normalised weight per original dim — a parallel fold+reduce. `max` is exact and
+        //    order-independent, so the chunking cannot change any value.
+        let maxw_orig: HashMap<u32, f64> = normed
+            .par_iter()
+            .fold(HashMap::new, |mut m, v| {
+                for &(d, w) in v {
+                    if shared(d) {
+                        let e = m.entry(d).or_insert(0.0);
+                        if w > *e {
+                            *e = w;
+                        }
+                    }
+                }
+                m
+            })
+            .reduce(HashMap::new, |mut a, mut b| {
+                if a.len() < b.len() {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                for (d, w) in b {
+                    let e = a.entry(d).or_insert(0.0);
+                    if w > *e {
+                        *e = w;
+                    }
+                }
+                a
+            });
+        // 4. Rank dims by (max weight ASC, dim asc) → dense global order. Ascending so the common,
         //    low-weight dims land at the FRONT: they fill the un-indexed prefix (their tiny
         //    `w·maxw` keeps the cumulative bound under `t` for many of them), and only the rare,
         //    high-weight tail is indexed — short postings. (Reversing this indexes the common dims
         //    and their huge postings, which is correct but orders of magnitude slower.)
+        //    The comparator is a total order on distinct dims, so the unstable parallel sort yields
+        //    the same unique sorted sequence the serial stable sort it replaces would.
         let mut dims_sorted: Vec<(u32, f64)> = maxw_orig.into_iter().collect();
-        dims_sorted.sort_by(|a, b| {
+        dims_sorted.par_sort_unstable_by(|a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0))
         });
         let rank: HashMap<u32, u32> =
             dims_sorted.iter().enumerate().map(|(i, &(d, _))| (d, i as u32)).collect();
         let ndims = dims_sorted.len();
         let maxw: Vec<f64> = dims_sorted.iter().map(|&(_, w)| w).collect();
-        // 4. CSR with relabelled dims, ascending within each row.
+        // 5. CSR with relabelled dims, ascending within each row. Relabel + sort each row in
+        //    parallel (rank lookups are the cost), then a serial flatten into the flat CSR arrays —
+        //    a pure memcpy; a parallel fill into disjoint slices would need unsafe borrows for no
+        //    measurable win. Hapax dims have no rank, so the `rank.get` filter drops them.
         let mut indptr = Vec::with_capacity(n + 1);
         indptr.push(0);
-        let mut dims = Vec::new();
-        let mut wts = Vec::new();
+        let mut off = 0usize;
         for v in &normed {
-            let mut rv: Vec<(u32, f64)> = v.iter().map(|&(d, w)| (rank[&d], w)).collect();
-            rv.sort_unstable_by_key(|&(d, _)| d);
+            let kept = if strip_hapax {
+                v.iter().filter(|&&(d, _)| rank.contains_key(&d)).count()
+            } else {
+                v.len()
+            };
+            off += kept;
+            indptr.push(off);
+        }
+        let relabelled: Vec<Vec<(u32, f64)>> = normed
+            .par_iter()
+            .map(|v| {
+                let mut rv: Vec<(u32, f64)> =
+                    v.iter().filter_map(|&(d, w)| rank.get(&d).map(|&r| (r, w))).collect();
+                rv.sort_unstable_by_key(|&(d, _)| d);
+                rv
+            })
+            .collect();
+        let mut dims = Vec::with_capacity(off);
+        let mut wts = Vec::with_capacity(off);
+        for rv in relabelled {
             for (d, w) in rv {
                 dims.push(d);
                 wts.push(w);
             }
-            indptr.push(dims.len());
         }
         Corpus { n, ndims, indptr, dims, wts, maxw }
     }
@@ -248,7 +353,52 @@ struct Scratch {
     touched: Vec<u32>,
     /// Probe prefix L2 norms for this probe: `xpn[k] = ‖wi[..k]‖₂`, length `nnz+1`.
     xpn: Vec<f64>,
+    /// Sparse-mode accumulator: `(candidate, partial dot)` pairs sorted by candidate id — the
+    /// touched list and the accumulator merged (classic L2AP). Used instead of `acc`/`touched` when
+    /// the corpus's average per-probe candidate count is low; the probe falls back to the dense pair
+    /// if the list overflows [`LIST_ACC_MAX`].
+    list: Vec<(u32, f64)>,
 }
+
+/// Accumulator strategy for the probe phase, chosen per join from the corpus's shape (and forced
+/// per-mode in tests — the two must agree bit-for-bit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccMode {
+    /// Dense `acc[n]` array: O(1) scatter per posting entry. Wins when probes touch many candidates.
+    Dense,
+    /// Sorted `(y, acc)` list: few candidates per probe ⇒ the list stays tiny and L1-resident, and
+    /// the n-wide dense array's footprint never competes with the postings for L2.
+    Sparse,
+}
+
+/// Average per-probe posting touches at/below which [`cosine_join`] picks the [`AccMode::Sparse`]
+/// accumulator. The touch volume is estimated from the built index as `Σ len²/2` (posting `d` is
+/// walked by about half the probes, each walk visiting `len` entries) divided by `n` — the per-probe
+/// mean walk volume, a corpus-shape signal. Per-probe outliers are caught by [`LIST_ACC_MAX`]'s
+/// dense fallback.
+const LIST_ACC_MAX_TOUCHES: usize = 32;
+
+/// Pick the accumulator mode from a built inverted index: sparse list when the average probe walks
+/// few posting entries, dense scatter otherwise.
+#[must_use]
+fn acc_mode_for(index: &[Vec<(u32, f64)>], n: usize) -> AccMode {
+    let mut walks = 0u64;
+    for p in index {
+        let len = p.len() as u64;
+        walks += len * len;
+    }
+    if walks / 2 / (n.max(1) as u64) < LIST_ACC_MAX_TOUCHES as u64 {
+        AccMode::Sparse
+    } else {
+        AccMode::Dense
+    }
+}
+
+/// Hard cap on one probe's sparse list: beyond this the per-insert memmove dominates the O(1)
+/// dense scatter it replaces, so [`accumulate_list`] bails out and the probe is redone densely
+/// (re-walking its postings — rare by construction; the additions repeat in the same order, so the
+/// values are unchanged).
+const LIST_ACC_MAX: usize = 512;
 
 /// Exact all-pairs cosine join via inverted index + **L2AP** prefix filtering and accumulation-time
 /// pruning. Returns `(j, i, cos)` with `j < i` for every pair with `cos ≥ t`. Bit-identical pair set
@@ -276,24 +426,153 @@ pub fn cosine_join(c: &Corpus, t: f64) -> Vec<(usize, usize, f64)> {
         let (di, wi) = c.row(i);
         index_suffix(c, i, (di, wi), t, &mut index, &mut cached);
     }
-    // Probe vectors in parallel; each worker keeps one reusable `Scratch` (an `n`-wide accumulator).
-    // `with_min_len` batches many probes per rayon task so the per-probe work (tiny) isn't dwarfed by
-    // task-splitting / scheduling overhead (`swtch_pri` in the profile).
+    // Accumulator strategy from the corpus shape: few candidates per probe on average (sparse /
+    // duplicate-heavy corpora) ⇒ the sorted list wins; many (dense rows) ⇒ the O(1) dense scatter.
+    let mode = acc_mode_for(&index, n);
+    cosine_join_mode(c, t, &index, &cached, mode)
+}
+
+/// The join body under an explicit [`AccMode`]: probe vectors in parallel; each worker keeps one
+/// reusable `Scratch`. `with_min_len` batches many probes per rayon task so the per-probe work
+/// (tiny) isn't dwarfed by task-splitting / scheduling overhead (`swtch_pri` in the profile).
+#[must_use]
+fn cosine_join_mode(
+    c: &Corpus,
+    t: f64,
+    index: &[Vec<(u32, f64)>],
+    cached: &Cached,
+    mode: AccMode,
+) -> Vec<(usize, usize, f64)> {
+    let n = c.n;
     (0..n)
         .into_par_iter()
         .with_min_len(256)
         .map_init(
-            || Scratch { acc: vec![-1.0; n], touched: Vec::new(), xpn: Vec::new() },
+            || Scratch { acc: vec![-1.0; n], touched: Vec::new(), xpn: Vec::new(), list: Vec::new() },
             |scratch, i| {
-                let (di, wi) = c.row(i);
-                accumulate(&index, (di, wi), i as u32, scratch);
                 let mut out = Vec::new();
-                verify_pruned(c, i, t, scratch, &cached, &mut out);
+                probe_half(c, i, t, index, cached, mode, scratch, &mut out);
                 out
             },
         )
         .flatten()
         .collect()
+}
+
+/// One probe's accumulate + prune + score against `c`'s index, under `mode`, appending to `out`.
+/// Shared by the single join and the fused two-corpus join so the per-half work is structurally
+/// identical (the fused join relies on that for its bit-identical halves).
+#[allow(clippy::too_many_arguments, clippy::inline_always)]
+#[inline(always)] // per-probe dispatch only — must fold into the rayon closure, not add a call
+fn probe_half(
+    c: &Corpus,
+    i: usize,
+    t: f64,
+    index: &[Vec<(u32, f64)>],
+    cached: &Cached,
+    mode: AccMode,
+    s: &mut Scratch,
+    out: &mut Vec<(usize, usize, f64)>,
+) {
+    let (di, wi) = c.row(i);
+    match mode {
+        AccMode::Dense => {
+            accumulate(index, (di, wi), i as u32, s);
+            verify_pruned(c, i, t, s, cached, out);
+        }
+        AccMode::Sparse => {
+            if accumulate_list(index, (di, wi), i as u32, s) {
+                verify_list(c, i, t, s, cached, out);
+            } else {
+                // The sparse list overflowed — redo this probe with the dense pass (identical
+                // additions, identical order, so the values are unchanged).
+                accumulate(index, (di, wi), i as u32, s);
+                verify_pruned(c, i, t, s, cached, out);
+            }
+        }
+    }
+}
+
+/// [`cosine_join`] under an explicitly forced [`AccMode`]. Test-only: the fuzz gates must cover both
+/// modes, and the shape-based pick exercises only one of them per corpus.
+#[cfg(test)]
+#[must_use]
+fn cosine_join_for_mode(c: &Corpus, t: f64, mode: AccMode) -> Vec<(usize, usize, f64)> {
+    let n = c.n;
+    let mut index: Vec<Vec<(u32, f64)>> = vec![Vec::new(); c.ndims];
+    let mut cached = Cached { bound: vec![Bound { pnorm: 0.0, split: u32::MAX }; n] };
+    for i in 0..n {
+        let (di, wi) = c.row(i);
+        index_suffix(c, i, (di, wi), t, &mut index, &mut cached);
+    }
+    cosine_join_mode(c, t, &index, &cached, mode)
+}
+
+/// Fused two-corpus cosine join: one probe pass over `a` and `b` — two corpora with the **same row
+/// count**, the typical "two views of the same objects" shape (e.g. line-vectors and part-vectors of
+/// the same functions). Returns `(pairs_a, pairs_b)`; each half is **bit-identical** to a separate
+/// [`cosine_join`] on its corpus — the per-half phases ([`accumulate`]/[`accumulate_list`],
+/// [`verify_pruned`]/[`verify_list`]) run on the same inputs in the same order, only the rayon
+/// schedule and the per-worker [`Scratch`] are shared (one `acc` buffer serves both halves: half A's
+/// entries are reset by its verify pass before half B accumulates).
+///
+/// Wins over two separate joins by paying the per-probe fixed costs once: one parallel schedule, one
+/// `Scratch` per worker, and the probe iteration bookkeeping is shared. Pair order within each half
+/// is arbitrary (as in [`cosine_join`]). The accumulator mode is chosen per corpus from its shape
+/// (see [`cosine_join`]), so the halves may use different modes.
+///
+/// # Panics
+///
+/// Panics if `a.len() != b.len()`.
+#[must_use]
+pub fn cosine_join_double(
+    a: &Corpus,
+    b: &Corpus,
+    t: f64,
+) -> (Vec<(usize, usize, f64)>, Vec<(usize, usize, f64)>) {
+    assert_eq!(a.n, b.n, "cosine_join_double: corpora must share the row count");
+    let n = a.n;
+    let mut index_a: Vec<Vec<(u32, f64)>> = vec![Vec::new(); a.ndims];
+    let mut index_b: Vec<Vec<(u32, f64)>> = vec![Vec::new(); b.ndims];
+    let mut cached_a = Cached { bound: vec![Bound { pnorm: 0.0, split: u32::MAX }; n] };
+    let mut cached_b = Cached { bound: vec![Bound { pnorm: 0.0, split: u32::MAX }; n] };
+    for i in 0..n {
+        let (di, wi) = a.row(i);
+        index_suffix(a, i, (di, wi), t, &mut index_a, &mut cached_a);
+        let (di, wi) = b.row(i);
+        index_suffix(b, i, (di, wi), t, &mut index_b, &mut cached_b);
+    }
+    let mode_a = acc_mode_for(&index_a, n);
+    let mode_b = acc_mode_for(&index_b, n);
+    (0..n)
+        .into_par_iter()
+        .with_min_len(256)
+        .map_init(
+            || Scratch { acc: vec![-1.0; n], touched: Vec::new(), xpn: Vec::new(), list: Vec::new() },
+            |scratch, i| {
+                let mut out_a = Vec::new();
+                probe_half(a, i, t, &index_a, &cached_a, mode_a, scratch, &mut out_a);
+                let mut out_b = Vec::new();
+                probe_half(b, i, t, &index_b, &cached_b, mode_b, scratch, &mut out_b);
+                (out_a, out_b)
+            },
+        )
+        .fold(
+            || (Vec::new(), Vec::new()),
+            |(mut va, mut vb), (oa, ob)| {
+                va.extend(oa);
+                vb.extend(ob);
+                (va, vb)
+            },
+        )
+        .reduce(
+            || (Vec::new(), Vec::new()),
+            |(mut a1, mut b1), (mut a2, mut b2)| {
+                a1.append(&mut a2);
+                b1.append(&mut b2);
+                (a1, b1)
+            },
+        )
 }
 
 /// Run the cosine join under a chosen [`Concurrency`] backend. Returns `(j, i, cos)` pairs with
@@ -478,9 +757,60 @@ fn accumulate(index: &[Vec<(u32, f64)>], (di, wi): (&[u32], &[f64]), cutoff: u32
     unsafe { touched.set_len(tlen) };
 }
 
-/// Phase 2 — prune + verify. For each touched candidate `y`, reset its accumulator and test the
-/// **L2AP `l2` bound**: the dot mass missing from `acc[y]` (the dims in `prefix(y)`) is at most
-/// `‖x_{rank<split[y]}‖ · ‖prefix(y)‖` by Cauchy–Schwarz, where `x_{rank<split[y]}` is the probe
+/// Fill `xpn` with the probe's running prefix L2 norms (`xpn[k] = ‖wi[..k]‖₂`) and return the full
+/// probe norm plus whether the cheap monotone pre-bound is worth it for this row length. One sqrt
+/// per probe dim, reused across all its candidates.
+///
+/// Since `xpn` is monotonic, `xpn[kstar] ≤ xnorm` for every candidate, so `a + xnorm·pnorm ≥ a +
+/// xpn[kstar]·pnorm` (the exact bound). A candidate failing the cheap `a + xnorm·pnorm < need` test
+/// therefore also fails the exact bound — prune it without the per-candidate `partition_point`. The
+/// survivor set is bit-identical; only the binary search is skipped for the ~99% of touched
+/// candidates that can't reach `t` on dense corpora.
+#[must_use]
+fn probe_prefix_norms(wi: &[f64], xpn: &mut Vec<f64>) -> (f64, bool) {
+    xpn.clear();
+    xpn.push(0.0);
+    let mut sq = 0.0f64;
+    for &w in wi {
+        sq += w * w;
+        xpn.push(sq.sqrt());
+    }
+    (sq.sqrt(), wi.len() >= PREBOUND_MIN_DIMS)
+}
+
+/// Per-candidate Cauchy–Schwarz prune test, shared by the dense verify pass, the sparse verify pass
+/// and the GPU survivor collector: `true` iff candidate `y` (accumulated partial dot `a`) survives —
+/// i.e. its exact [`cos_full`] score must be computed. The bound is a filter only; the emitted value
+/// is always the exact dot, so the pair set is bit-identical to brute force whatever this decides.
+#[must_use]
+#[inline(always)]
+#[allow(clippy::inline_always)] // this runs once per touched candidate — call overhead is the cost
+fn candidate_survives(
+    di: &[u32],
+    xpn: &[f64],
+    xnorm: f64,
+    prebound: bool,
+    need: f64,
+    a: f64,
+    bd: Bound,
+) -> bool {
+    // Cheap monotone pre-bound (dense rows only) — skip the binary search when even `xnorm` can't
+    // clear `need`. `prebound` is loop-invariant, so sparse rows pay nothing.
+    if prebound && a + xnorm * bd.pnorm < need {
+        return false;
+    }
+    // Number of probe dims with rank < split[y] → index into xpn (di sorted ascending).
+    let kstar = di.partition_point(|&d| d < bd.split);
+    // SAFETY: kstar ≤ di.len() == wi.len() = xpn.len()-1.
+    // (An added maxweight cap `min(…, Σ wx·maxw)` was tried + reverted: never tighter than the
+    // L2 cap on either synthetic or real data — it sums over all probe-prefix dims, not just the
+    // shared ones — so it pruned nothing and cost ~16% on the real PyPI corpus.)
+    a + unsafe { xpn.get_unchecked(kstar) } * bd.pnorm >= need
+}
+
+/// Phase 2 — prune + verify (dense mode). For each touched candidate `y`, reset its accumulator and
+/// test the **L2AP `l2` bound**: the dot mass missing from `acc[y]` (the dims in `prefix(y)`) is at
+/// most `‖x_{rank<split[y]}‖ · ‖prefix(y)‖` by Cauchy–Schwarz, where `x_{rank<split[y]}` is the probe
 /// restricted to the rank range `prefix(y)` lives in. Since the probe's mass sits in its rare
 /// (high-rank) dims, that restricted norm is tiny — a far tighter cap than the whole-probe `‖x‖=1`.
 /// Only if `acc[y] + that bound ≥ t` (minus FP slack) do we score exactly with [`cos_full`]. Filter
@@ -495,24 +825,9 @@ fn verify_pruned(
     out: &mut Vec<(usize, usize, f64)>,
 ) {
     let (di, wi) = c.row(i);
-    // Probe prefix L2 norms: xpn[k] = ‖wi[..k]‖₂ (di ascending by rank, so xpn[k] = norm over the
-    // probe's k lowest-rank dims). One sqrt per probe dim, reused across all its candidates.
-    s.xpn.clear();
-    s.xpn.push(0.0);
-    let mut sq = 0.0f64;
-    for &w in wi {
-        sq += w * w;
-        s.xpn.push(sq.sqrt());
-    }
-    // `‖probe‖` = the full prefix norm. Since `xpn` is monotonic, `xpn[kstar] ≤ xnorm` for every
-    // candidate, so `a + xnorm·pnorm ≥ a + xpn[kstar]·pnorm` (the exact bound). A candidate failing
-    // the cheap `a + xnorm·pnorm < need` test therefore also fails the exact bound — prune it without
-    // the per-candidate `partition_point`. The survivor set is bit-identical; only the binary search
-    // is skipped for the ~99% of touched candidates that can't reach `t` on dense corpora.
-    let xnorm = sq.sqrt();
-    let prebound = di.len() >= PREBOUND_MIN_DIMS;
+    let (xnorm, prebound) = probe_prefix_norms(wi, &mut s.xpn);
     let need = t - PRUNE_SLACK;
-    let Scratch { acc, touched, xpn } = s;
+    let Scratch { acc, touched, xpn, .. } = s;
     // (Software-prefetching the candidate row a few ahead was tried + reverted: no measurable change
     // — with all cores gathering at once the join is memory-*bandwidth*-bound, not per-access
     // latency-bound, so prefetch can't add throughput.)
@@ -522,19 +837,73 @@ fn verify_pruned(
         let a = unsafe { std::mem::replace(acc.get_unchecked_mut(yu), -1.0) };
         // SAFETY: `yu < n`. One scattered load fetches both prune fields.
         let bd = unsafe { *cached.bound.get_unchecked(yu) };
-        // Cheap monotone pre-bound (dense rows only) — skip the binary search when even `xnorm`
-        // can't clear `need`. `prebound` is loop-invariant, so sparse rows pay nothing.
-        if prebound && a + xnorm * bd.pnorm < need {
-            continue;
+        if candidate_survives(di, xpn, xnorm, prebound, need, a, bd) {
+            let cos = cos_full((di, wi), c.row(yu));
+            if cos >= t {
+                out.push((yu, i, cos));
+            }
         }
-        // Number of probe dims with rank < split[y] → index into xpn (di sorted ascending).
-        let kstar = di.partition_point(|&d| d < bd.split);
-        // SAFETY: kstar ≤ di.len() == wi.len() = xpn.len()-1.
-        // (An added maxweight cap `min(…, Σ wx·maxw)` was tried + reverted: never tighter than the
-        // L2 cap on either synthetic or real data — it sums over all probe-prefix dims, not just the
-        // shared ones — so it pruned nothing and cost ~16% on the real PyPI corpus.)
-        let bound = a + unsafe { xpn.get_unchecked(kstar) } * bd.pnorm;
-        if bound >= need {
+    }
+}
+
+/// Sparse-mode phase 1 — the same partial-dot accumulation as [`accumulate`], but into the sorted
+/// `(y, acc)` list instead of the dense `acc[n]` array. Wins when a probe touches few candidates:
+/// the list stays tiny and L1-resident, and the n-wide dense array's footprint never competes with
+/// the postings for L2. The additions happen in the same per-dim/posting order, so the accumulated
+/// values are bit-identical to the dense pass. Returns `false` on [`LIST_ACC_MAX`] overflow — the
+/// caller must redo the probe densely (identical additions, identical order).
+#[cfg_attr(feature = "profiling", inline(never))]
+fn accumulate_list(
+    index: &[Vec<(u32, f64)>],
+    (di, wi): (&[u32], &[f64]),
+    cutoff: u32,
+    s: &mut Scratch,
+) -> bool {
+    let Scratch { list, .. } = s;
+    list.clear();
+    for (&d, &w) in di.iter().zip(wi) {
+        for &(y, wy) in &index[d as usize] {
+            if y >= cutoff {
+                break;
+            }
+            let term = w * wy;
+            match list.binary_search_by_key(&y, |&(yy, _)| yy) {
+                Ok(k) => list[k].1 += term,
+                Err(k) => {
+                    if list.len() >= LIST_ACC_MAX {
+                        list.clear();
+                        return false;
+                    }
+                    list.insert(k, (y, term));
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Sparse-mode phase 2 — the same prune + score as [`verify_pruned`], over the sorted accumulator
+/// list. No reset needed: the next probe's [`accumulate_list`] clears the list. Candidate order is
+/// by id (the dense pass visits first-touch order); both are "arbitrary order" for the caller, and
+/// the per-candidate arithmetic is identical, so the emitted pair set + scores are bit-identical.
+#[cfg_attr(feature = "profiling", inline(never))]
+fn verify_list(
+    c: &Corpus,
+    i: usize,
+    t: f64,
+    s: &mut Scratch,
+    cached: &Cached,
+    out: &mut Vec<(usize, usize, f64)>,
+) {
+    let (di, wi) = c.row(i);
+    let (xnorm, prebound) = probe_prefix_norms(wi, &mut s.xpn);
+    let need = t - PRUNE_SLACK;
+    let Scratch { list, xpn, .. } = s;
+    for &(y, a) in list.iter() {
+        let yu = y as usize;
+        // SAFETY: `yu < n` (candidate ids come from the postings, same as in `accumulate`).
+        let bd = unsafe { *cached.bound.get_unchecked(yu) };
+        if candidate_survives(di, xpn, xnorm, prebound, need, a, bd) {
             let cos = cos_full((di, wi), c.row(yu));
             if cos >= t {
                 out.push((yu, i, cos));
@@ -592,34 +961,21 @@ fn index_suffix(
 const GPU_FILTER_MARGIN: f64 = 1e-4;
 
 /// Like the verify half of [`verify_pruned`], but instead of scoring, **collects** each surviving
-/// `(candidate, probe)` pair (`candidate < probe`) for batch scoring elsewhere. The bound here MUST
-/// stay identical to `verify_pruned`'s so the survivor set matches exactly.
+/// `(candidate, probe)` pair (`candidate < probe`) for batch scoring elsewhere. The bound test is
+/// [`candidate_survives`] — the same function `verify_pruned` uses — so the survivor set is
+/// identical by construction.
 #[cfg(all(target_os = "macos", feature = "gpu"))]
 fn collect_survivors(c: &Corpus, i: usize, t: f64, s: &mut Scratch, cached: &Cached, out: &mut Vec<(u32, u32)>) {
     let (di, wi) = c.row(i);
-    s.xpn.clear();
-    s.xpn.push(0.0);
-    let mut sq = 0.0f64;
-    for &w in wi {
-        sq += w * w;
-        s.xpn.push(sq.sqrt());
-    }
-    let xnorm = sq.sqrt();
-    let prebound = di.len() >= PREBOUND_MIN_DIMS;
+    let (xnorm, prebound) = probe_prefix_norms(wi, &mut s.xpn);
     let need = t - PRUNE_SLACK;
-    let Scratch { acc, touched, xpn } = s;
+    let Scratch { acc, touched, xpn, .. } = s;
     for &y in touched.iter() {
         let yu = y as usize;
         // SAFETY: `yu < n` (same provenance as in `accumulate`).
         let a = unsafe { std::mem::replace(acc.get_unchecked_mut(yu), -1.0) };
         let bd = unsafe { *cached.bound.get_unchecked(yu) };
-        // Cheap monotone pre-bound (see `verify_pruned`) — same survivor set, skips the binary search.
-        if prebound && a + xnorm * bd.pnorm < need {
-            continue;
-        }
-        let kstar = di.partition_point(|&d| d < bd.split);
-        let bound = a + unsafe { xpn.get_unchecked(kstar) } * bd.pnorm;
-        if bound >= need {
+        if candidate_survives(di, xpn, xnorm, prebound, need, a, bd) {
             out.push((y, i as u32)); // (candidate, probe), candidate < probe
         }
     }
@@ -706,7 +1062,7 @@ fn survivor_pairs(c: &Corpus, t: f64) -> (Vec<u32>, Vec<u32>) {
         .into_par_iter()
         .with_min_len(256)
         .map_init(
-            || Scratch { acc: vec![-1.0; n], touched: Vec::new(), xpn: Vec::new() },
+            || Scratch { acc: vec![-1.0; n], touched: Vec::new(), xpn: Vec::new(), list: Vec::new() },
             |scratch, i| {
                 let (di, wi) = c.row(i);
                 accumulate(&index, (di, wi), i as u32, scratch);
@@ -734,31 +1090,19 @@ pub fn cosine_join_counts(c: &Corpus, t: f64) -> (u64, u64, u64) {
         let (di, wi) = c.row(i);
         index_suffix(c, i, (di, wi), t, &mut index, &mut cached);
     }
-    let mut s = Scratch { acc: vec![-1.0; n], touched: Vec::new(), xpn: Vec::new() };
+    let mut s = Scratch { acc: vec![-1.0; n], touched: Vec::new(), xpn: Vec::new(), list: Vec::new() };
     let (mut ncand, mut survivors, mut pairs) = (0u64, 0u64, 0u64);
     let need = t - PRUNE_SLACK;
     for i in 0..n {
         let (di, wi) = c.row(i);
         accumulate(&index, (di, wi), i as u32, &mut s);
         ncand += s.touched.len() as u64;
-        s.xpn.clear();
-        s.xpn.push(0.0);
-        let mut sq = 0.0f64;
-        for &w in wi {
-            sq += w * w;
-            s.xpn.push(sq.sqrt());
-        }
-        let xnorm = sq.sqrt();
-        let prebound = di.len() >= PREBOUND_MIN_DIMS;
+        let (xnorm, prebound) = probe_prefix_norms(wi, &mut s.xpn);
         for &y in &s.touched {
             let yu = y as usize;
             let a = std::mem::replace(&mut s.acc[yu], -1.0);
             let bd = cached.bound[yu];
-            if prebound && a + xnorm * bd.pnorm < need {
-                continue;
-            }
-            let kstar = di.partition_point(|&d| d < bd.split);
-            if a + s.xpn[kstar] * bd.pnorm >= need {
+            if candidate_survives(di, &s.xpn, xnorm, prebound, need, a, bd) {
                 survivors += 1;
                 if cos_full((di, wi), c.row(yu)) >= t {
                     pairs += 1;
@@ -787,7 +1131,10 @@ pub fn cosine_join_bruteforce(c: &Corpus, t: f64) -> Vec<(usize, usize, f64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cosine_join, cosine_join_bruteforce, Corpus};
+    use super::{
+        cosine_join, cosine_join_bruteforce, cosine_join_double, cosine_join_for_mode, AccMode,
+        Corpus,
+    };
 
     fn xorshift(seed: u64) -> impl FnMut() -> u64 {
         let mut s = seed;
@@ -823,6 +1170,145 @@ mod tests {
                 let got = sort_pairs(cosine_join(&c, t));
                 let want = sort_pairs(cosine_join_bruteforce(&c, t));
                 assert_eq!(got, want, "n={n} t={t}");
+            }
+        }
+    }
+
+    /// `Corpus::from_rows` must be a deterministic function of its input: building the same rows
+    /// twice yields the same corpus, so the join output is bit-identical. (The previous
+    /// HashMap-based per-row merge summed weights in per-call-random hash order, so this did not
+    /// hold; it is now a pinned contract.)
+    #[test]
+    fn from_rows_is_deterministic() {
+        let mut next = xorshift(0x6f6c_6c61_6279_6e6f);
+        for _ in 0..20 {
+            let n = (next() % 30 + 2) as usize;
+            let dim_space = next() % 12 + 1;
+            let rows: Vec<Vec<(u32, f64)>> = (0..n)
+                .map(|_| {
+                    let nnz = (next() % 9) as usize;
+                    let mut r: Vec<(u32, f64)> = (0..nnz)
+                        .map(|_| ((next() % dim_space) as u32, (next() % 10 + 1) as f64))
+                        .collect();
+                    // Force duplicate dims so the merge path runs and the sum order matters.
+                    if nnz > 1 {
+                        r[1].0 = r[0].0;
+                    }
+                    r
+                })
+                .collect();
+            let a = Corpus::from_rows(&rows);
+            let b = Corpus::from_rows(&rows);
+            for &t in &[0.3_f64, 0.7] {
+                assert_eq!(
+                    sort_pairs(cosine_join(&a, t)),
+                    sort_pairs(cosine_join(&b, t)),
+                    "n={n} t={t}"
+                );
+            }
+        }
+    }
+
+    /// Stripping `df = 1` dims from the corpus must be invisible to the join: a hapax dim is shared
+    /// by no pair, so it contributes exactly `0.0` to every pairwise dot (the branchless `cos_full`
+    /// accumulates `+0.0` no-ops on non-negative sums), its posting is never walked, and the tighter
+    /// Cauchy–Schwarz bounds only prune more. The stripped and un-stripped builds must therefore
+    /// return bit-identical pair sets, and each must match its own brute-force oracle.
+    #[test]
+    fn hapax_stripping_is_invisible() {
+        let mut next = xorshift(0x51a7_4e5f_0c92_83d6);
+        for _ in 0..200 {
+            let n = (next() % 40 + 2) as usize;
+            let dim_space = next() % 12 + 1;
+            let rows: Vec<Vec<(u32, f64)>> = (0..n)
+                .map(|i| {
+                    let nnz = (next() % 8) as usize;
+                    let mut r: Vec<(u32, f64)> = (0..nnz)
+                        .map(|_| ((next() % dim_space) as u32, (next() % 10 + 1) as f64))
+                        .collect();
+                    // Every row carries one unique dim — a guaranteed hapax the strip must remove
+                    // invisibly (its mass participates in the L2 normalisation of the full row).
+                    r.push((1000 + i as u32, 1.0));
+                    r
+                })
+                .collect();
+            let full = Corpus::from_rows_with(&rows, false);
+            let stripped = Corpus::from_rows_with(&rows, true);
+            for &t in &[0.1_f64, 0.25, 0.5, 0.75, 0.9, 1.0] {
+                let want = sort_pairs(cosine_join_bruteforce(&stripped, t));
+                assert_eq!(
+                    sort_pairs(cosine_join(&stripped, t)),
+                    want,
+                    "stripped vs oracle, n={n} t={t}"
+                );
+                assert_eq!(
+                    sort_pairs(cosine_join(&full, t)),
+                    want,
+                    "stripped vs full, n={n} t={t}"
+                );
+                assert_eq!(
+                    sort_pairs(cosine_join(&full, t)),
+                    sort_pairs(cosine_join_bruteforce(&full, t)),
+                    "full vs its own oracle, n={n} t={t}"
+                );
+            }
+        }
+    }
+
+    /// Both accumulator strategies must agree bit-for-bit with brute force. The shape-based mode
+    /// pick in `cosine_join` means any given corpus exercises only one strategy — force each here
+    /// (the dense pass is what the large-corpus shape selects, the sparse list the duplicate-heavy
+    /// consumer shape).
+    #[test]
+    fn both_acc_modes_match_bruteforce() {
+        let mut next = xorshift(0x5eed_0f1a_2b3c_4d5e);
+        for _ in 0..200 {
+            let n = (next() % 40 + 2) as usize;
+            let dim_space = next() % 15 + 1;
+            let rows: Vec<Vec<(u32, f64)>> = (0..n)
+                .map(|_| {
+                    let nnz = (next() % 8) as usize;
+                    (0..nnz)
+                        .map(|_| ((next() % dim_space) as u32, (next() % 10 + 1) as f64))
+                        .collect()
+                })
+                .collect();
+            let c = Corpus::from_rows(&rows);
+            for &t in &[0.1_f64, 0.25, 0.5, 0.75, 0.9, 1.0] {
+                let want = sort_pairs(cosine_join_bruteforce(&c, t));
+                for mode in [AccMode::Dense, AccMode::Sparse] {
+                    let got = sort_pairs(cosine_join_for_mode(&c, t, mode));
+                    assert_eq!(got, want, "n={n} t={t} mode={mode:?}");
+                }
+            }
+        }
+    }
+
+    /// The fused two-corpus join must return, per half, the bit-identical pair set of a separate
+    /// `cosine_join` on that corpus — fusion shares only schedule and scratch, never arithmetic.
+    #[test]
+    fn double_join_matches_single() {
+        let mut next = xorshift(0xd0a2_7b7e_9c31_5f84);
+        for _ in 0..200 {
+            let n = (next() % 40 + 2) as usize;
+            let dim_space = next() % 15 + 1;
+            let mut gen = || -> Vec<Vec<(u32, f64)>> {
+                (0..n)
+                    .map(|_| {
+                        let nnz = (next() % 8) as usize;
+                        (0..nnz)
+                            .map(|_| ((next() % dim_space) as u32, (next() % 10 + 1) as f64))
+                            .collect()
+                    })
+                    .collect()
+            };
+            let (rows_a, rows_b) = (gen(), gen());
+            let a = Corpus::from_rows(&rows_a);
+            let b = Corpus::from_rows(&rows_b);
+            for &t in &[0.1_f64, 0.3, 0.5, 0.7, 0.9, 1.0] {
+                let (ga, gb) = cosine_join_double(&a, &b, t);
+                assert_eq!(sort_pairs(ga), sort_pairs(cosine_join(&a, t)), "half a n={n} t={t}");
+                assert_eq!(sort_pairs(gb), sort_pairs(cosine_join(&b, t)), "half b n={n} t={t}");
             }
         }
     }
