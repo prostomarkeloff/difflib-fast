@@ -43,6 +43,9 @@ use rayon::prelude::*;
 
 use crate::Concurrency;
 
+/// One join's result: `(row_a, row_b, cosine)` triples with `row_a < row_b`, arbitrary order.
+pub type JoinPairs = Vec<(usize, usize, f64)>;
+
 /// A corpus of L2-normalised sparse non-negative vectors in CSR form, with dimensions relabelled to
 /// a global rank (decreasing max weight). Built once; joinable at any threshold.
 pub struct Corpus {
@@ -525,11 +528,7 @@ fn cosine_join_for_mode(c: &Corpus, t: f64, mode: AccMode) -> Vec<(usize, usize,
 ///
 /// Panics if `a.len() != b.len()`.
 #[must_use]
-pub fn cosine_join_double(
-    a: &Corpus,
-    b: &Corpus,
-    t: f64,
-) -> (Vec<(usize, usize, f64)>, Vec<(usize, usize, f64)>) {
+pub fn cosine_join_double(a: &Corpus, b: &Corpus, t: f64) -> (JoinPairs, JoinPairs) {
     assert_eq!(a.n, b.n, "cosine_join_double: corpora must share the row count");
     let n = a.n;
     let mut index_a: Vec<Vec<(u32, f64)>> = vec![Vec::new(); a.ndims];

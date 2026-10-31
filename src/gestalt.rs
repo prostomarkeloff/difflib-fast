@@ -894,7 +894,7 @@ impl Builder {
     fn sort_big(&mut self, out: &mut Sam, nstates: usize, blen: usize) {
         // sorted copies for the big endpos sets (a handful of states: short, frequent substrings);
         // positions are below `blen`, so a radix sort needs one pass per byte of that
-        let passes = ((usize::BITS - blen.leading_zeros()) as usize).div_ceil(8).max(1);
+        let passes = (blen.bit_width() as usize).div_ceil(8).max(1);
         let scratch = &mut self.child_arr;
         for s in 0..nstates {
             let cnt = out.chain_slot[s][7] as usize;
