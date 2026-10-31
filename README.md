@@ -42,7 +42,7 @@ assert_eq!(ratio("the quick brown fox", "the quick brown dog"), 0.89473684210526
 ```
 
 ```toml
-difflib-fast = "0.3"
+difflib-fast = "0.5"
 ```
 
 ---
