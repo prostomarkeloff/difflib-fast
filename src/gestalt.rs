@@ -1593,6 +1593,9 @@ pub fn gestalt_edge_bounded(a: &[char], b: &[char], sam_b: &Sam, threshold: f64)
     if total == 0 {
         return true;
     }
+    if a == b {
+        return true; // ratio(x, x) = 1.0 >= any threshold — exact and orientation-free
+    }
     let need = (threshold * total as f64 / 2.0).ceil() as usize;
     if need == 0 {
         return true;
@@ -1715,6 +1718,9 @@ pub fn gestalt_qualifies_ms(a: &[char], b: &[char], sam_b: &Sam, threshold: f64,
     let total = na + nb;
     if total == 0 {
         return true;
+    }
+    if a == b {
+        return true; // ratio(x, x) = 1.0 >= any threshold — exact and orientation-free
     }
     let need = (threshold * total as f64 / 2.0).ceil() as usize;
     if need == 0 {
@@ -1939,6 +1945,11 @@ pub fn gestalt_ratio_capped(a: &[char], b: &[char], sam_b: &Sam, cap: f64) -> f6
     let total = na + nb;
     if total == 0 {
         return 1.0; // two empty strings ⇒ ratio 1.0
+    }
+    if a == b {
+        // ratio(x, x) = 1.0, exact and orientation-free; the capped contract returns the exact
+        // ratio when it does not exceed the cap, the sentinel otherwise.
+        return if 1.0 <= cap { 1.0 } else { 2.0 };
     }
     if na == 0 || nb == 0 {
         return 0.0; // M = 0 ⇒ ratio 0 (a valid minimum candidate, <= cap for any cap >= 0)
