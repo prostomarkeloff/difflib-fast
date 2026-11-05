@@ -482,25 +482,37 @@ const SERIAL_BELOW: usize = 32;
 /// The strings' suffix automata, built on first use. A pair `(lo, hi)` scans `lo` against
 /// `hi`'s automaton, so only the strings that are the `hi` side of some pair that reaches the
 /// scan ever need one — in a group of two that is one automaton, not two, and the build is the
-/// single most expensive step per string.
+/// single most expensive step per string. Identical strings share one automaton by content: the
+/// SAM is a pure function of the string, so a duplicate-heavy group pays one build, not one per
+/// copy.
 pub(crate) struct LazySams<'a> {
     chars: &'a [Vec<char>],
     cells: Vec<std::sync::OnceLock<gestalt::Sam>>,
+    /// Per index, the cell it reads (the content group).
+    group: Vec<u32>,
 }
 
 impl<'a> LazySams<'a> {
     pub(crate) fn new(chars: &'a [Vec<char>]) -> Self {
-        Self { chars, cells: (0..chars.len()).map(|_| std::sync::OnceLock::new()).collect() }
+        let mut group = vec![0u32; chars.len()];
+        let mut groups: HashMap<&[char], u32> = HashMap::default();
+        for (i, c) in chars.iter().enumerate() {
+            let next = u32::try_from(groups.len()).unwrap_or(u32::MAX);
+            group[i] = *groups.entry(c.as_slice()).or_insert(next);
+        }
+        Self { chars, cells: (0..groups.len()).map(|_| std::sync::OnceLock::new()).collect(), group }
     }
 
-    /// Wrap automata that already exist (the GPU paths build every one up front).
+    /// Wrap automata that already exist (the GPU paths build every one up front) — one cell per
+    /// index, the historical shape.
     pub(crate) fn built(chars: &'a [Vec<char>], sams: Vec<gestalt::Sam>) -> Self {
         debug_assert_eq!(chars.len(), sams.len());
-        Self { chars, cells: sams.into_iter().map(std::sync::OnceLock::from).collect() }
+        let group = (0..chars.len()).map(|i| u32::try_from(i).unwrap_or(u32::MAX)).collect();
+        Self { chars, cells: sams.into_iter().map(std::sync::OnceLock::from).collect(), group }
     }
 
     pub(crate) fn get(&self, i: usize) -> &gestalt::Sam {
-        self.cells[i].get_or_init(|| gestalt::build_sam(&self.chars[i]))
+        self.cells[self.group[i] as usize].get_or_init(|| gestalt::build_sam(&self.chars[i]))
     }
 }
 
